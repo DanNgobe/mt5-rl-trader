@@ -43,37 +43,42 @@ def load_data(data_path: str) -> np.ndarray:
 def load_preprocessor(model_dir: str) -> FeatureProcessor:
     """
     Load preprocessor from saved parameters.
-    
+
     Args:
         model_dir: Directory containing preprocessor.npy
-        
+
     Returns:
         Configured FeatureProcessor
     """
     preprocessor_path = Path(model_dir) / "preprocessor.npy"
-    
+
     if not preprocessor_path.exists():
         raise FileNotFoundError(f"Preprocessor not found at {preprocessor_path}")
-    
+
     params = np.load(preprocessor_path, allow_pickle=True).item()
+
+    # Create processor with log_return method (default used in training)
+    processor = FeatureProcessor(price_method="log_return", volume_method="log")
+
+    # Check if we have valid saved parameters
+    has_price_params = params.get("price_reference") is not None
+    has_volume_params = params.get("volume_min") is not None
     
-    # Create processor and restore parameters
-    processor = FeatureProcessor()
-    
-    if params.get("price_reference") is not None:
+    if has_price_params and has_volume_params:
+        # Restore from saved parameters
         processor.price_scaler.reference_price = params["price_reference"]
         processor.price_scaler._fitted = True
-    
-    if params.get("price_mean") is not None:
-        processor.price_scaler.mean = params["price_mean"]
-        processor.price_scaler.std = params.get("price_std")
-        processor.price_scaler._fitted = True
-    
-    if params.get("volume_min") is not None:
+
         processor.volume_scaler.min_vol = params["volume_min"]
-        processor.volume_scaler.max_vol = params.get("volume_max")
+        processor.volume_scaler.max_vol = params["volume_max"]
         processor.volume_scaler._fitted = True
-    
+        
+        processor._fitted = True
+    else:
+        # Parameters not available - will need to fit on data
+        # This happens when using log/log_return methods which don't save params
+        processor._fitted = False
+
     return processor
 
 
@@ -215,7 +220,15 @@ def evaluate(
     try:
         processor = load_preprocessor(str(model_dir))
         print("Loaded preprocessor from model directory")
-        processed_data = processor.transform(data)
+        # Fit if needed (for log_return method where params aren't saved)
+        if not processor._fitted:
+            print("Fitting preprocessor on data...")
+            # Use config settings for technical indicators
+            preproc_config = config["preprocessing"]
+            processor.add_technical_indicators = preproc_config.get("add_technical_indicators", False)
+            processed_data = processor.fit_transform(data)
+        else:
+            processed_data = processor.transform(data)
     except FileNotFoundError:
         print("Preprocessor not found, applying fresh preprocessing...")
         preproc_config = config["preprocessing"]
