@@ -22,6 +22,7 @@ wheels/
 
 # Virtual environments
 venv/
+ENV/
 .venv/
 
 # Trading environment (keep source, ignore __pycache__)
@@ -37,9 +38,10 @@ env/__pycache__/
 # Environment variables
 .env
 
-# Models and logs
-models/
-logs/
+# Models and logs (keep .gitkeep)
+models/*.zip
+models/*.npy
+logs/*
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -55,4 +57,10 @@ htmlcov/
 
 # TensorBoard
 runs/
+
+# Data (keep sample data, ignore large downloads)
 data/raw
+data/processed/
+
+# Evaluation results
+data/evaluation/

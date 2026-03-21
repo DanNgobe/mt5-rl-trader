@@ -1,9 +1,22 @@
+# Core dependencies
 gymnasium>=0.28.0
 stable-baselines3>=2.0.0
-MetaTrader5>=5.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
+
+# Optional: MetaTrader 5 data download
+MetaTrader5>=5.0.0; platform_system == "Windows"
+
+# Optional: TensorBoard logging
 tensorboard>=2.14.0
+
+# Optional: Notebooks
+jupyter>=1.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scipy>=1.10.0
+
+# Development
 pytest>=7.0.0
