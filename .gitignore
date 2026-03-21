@@ -22,7 +22,6 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
 .venv/
 
 # Trading environment (keep source, ignore __pycache__)

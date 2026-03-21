@@ -1,0 +1,215 @@
+# Forex Pair Configurations
+# =========================
+# Specifications for each currency pair including pip values,
+# typical spreads, and trading hours.
+
+symbols:
+  # Major Pairs
+  # -----------
+  
+  EURUSD:
+    description: "Euro / US Dollar"
+    base_currency: EUR
+    quote_currency: USD
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 0.8
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01  # 1:100 leverage
+    trading_hours: "24/5"
+    session_open: "Sunday 22:00 GMT"
+    session_close: "Friday 22:00 GMT"
+  
+  GBPUSD:
+    description: "British Pound / US Dollar"
+    base_currency: GBP
+    quote_currency: USD
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.2
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  USDJPY:
+    description: "US Dollar / Japanese Yen"
+    base_currency: USD
+    quote_currency: JPY
+    pip_value: 0.01
+    pip_location: 2
+    typical_spread_pips: 0.8
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  USDCHF:
+    description: "US Dollar / Swiss Franc"
+    base_currency: USD
+    quote_currency: CHF
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.0
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  AUDUSD:
+    description: "Australian Dollar / US Dollar"
+    base_currency: AUD
+    quote_currency: USD
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.0
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  USDCAD:
+    description: "US Dollar / Canadian Dollar"
+    base_currency: USD
+    quote_currency: CAD
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.2
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  NZDUSD:
+    description: "New Zealand Dollar / US Dollar"
+    base_currency: NZD
+    quote_currency: USD
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.5
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  # Minor/Cross Pairs
+  # -----------------
+  
+  EURGBP:
+    description: "Euro / British Pound"
+    base_currency: EUR
+    quote_currency: GBP
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.5
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  EURJPY:
+    description: "Euro / Japanese Yen"
+    base_currency: EUR
+    quote_currency: JPY
+    pip_value: 0.01
+    pip_location: 2
+    typical_spread_pips: 1.5
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  GBPJPY:
+    description: "British Pound / Japanese Yen"
+    base_currency: GBP
+    quote_currency: JPY
+    pip_value: 0.01
+    pip_location: 2
+    typical_spread_pips: 2.5
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  EURCHF:
+    description: "Euro / Swiss Franc"
+    base_currency: EUR
+    quote_currency: CHF
+    pip_value: 0.0001
+    pip_location: 4
+    typical_spread_pips: 1.5
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+  
+  AUDJPY:
+    description: "Australian Dollar / Japanese Yen"
+    base_currency: AUD
+    quote_currency: JPY
+    pip_value: 0.01
+    pip_location: 2
+    typical_spread_pips: 2.0
+    min_lot: 0.01
+    max_lot: 100.0
+    lot_step: 0.01
+    contract_size: 100000
+    margin_requirement: 0.01
+    trading_hours: "24/5"
+
+
+# Default symbol for training
+# ===========================
+default_symbol: EURUSD
+
+
+# Symbol Groups
+# =============
+groups:
+  majors:
+    - EURUSD
+    - GBPUSD
+    - USDJPY
+    - USDCHF
+    - AUDUSD
+    - USDCAD
+    - NZDUSD
+  
+  crosses:
+    - EURGBP
+    - EURJPY
+    - GBPJPY
+    - EURCHF
+    - AUDJPY
+  
+  usd_pairs:
+    - EURUSD
+    - GBPUSD
+    - USDJPY
+    - USDCHF
+    - AUDUSD
+    - USDCAD
+    - NZDUSD

@@ -1,0 +1,143 @@
+# Trading Environment Configuration
+# ==================================
+
+environment:
+  # Observation window size (number of candles)
+  window_size: 10
+  
+  # Initial account balance
+  initial_balance: 10000.0
+  
+  # Trade simulator settings
+  spread: 0.0001          # 1 pip for EURUSD
+  slippage_prob: 0.3      # 30% chance of slippage
+  slippage_range: [0.00001, 0.0005]  # 0.1 to 5 pips
+  
+  # Episode termination
+  max_drawdown_pct: 0.5   # 50% drawdown triggers margin call
+
+
+# Data Configuration
+# ==================
+data:
+  # Path to raw data files
+  raw_data_dir: data/raw
+  
+  # Path for processed data
+  processed_data_dir: data/processed
+  
+  # Data columns (in order)
+  columns: [open, high, low, close, volume]
+  
+  # Timeframe for data
+  timeframe: H1  # H1, H4, D1, etc.
+
+
+# Preprocessing Configuration
+# ===========================
+preprocessing:
+  # Price normalization method: log_return, relative, zscore
+  price_method: log_return
+  
+  # Volume normalization method: log, minmax, zscore
+  volume_method: log
+  
+  # Add technical indicators
+  add_technical_indicators: true
+
+
+# PPO Agent Hyperparameters
+# =========================
+agent:
+  # Algorithm
+  algorithm: PPO
+  
+  # Policy network
+  policy: MlpPolicy
+  
+  # Network architecture
+  policy_kwargs:
+    net_arch:
+      - 256
+      - 128
+  
+  # Learning rate
+  learning_rate: 0.0003
+  
+  # Number of steps to run for each environment per update
+  n_steps: 2048
+  
+  # Batch size for training
+  batch_size: 64
+  
+  # Number of epochs when updating the policy
+  n_epochs: 10
+  
+  # Discount factor
+  gamma: 0.99
+  
+  # Factor for advantage estimation
+  gae_lambda: 0.95
+  
+  # Clipping parameter
+  clip_range: 0.2
+  
+  # Entropy coefficient
+  ent_coef: 0.01
+  
+  # Value function coefficient
+  vf_coef: 0.5
+  
+  # Maximum gradient norm
+  max_grad_norm: 0.5
+  
+  # PPO clip range for value function
+  clip_range_vf: null  # No clipping by default
+  
+  # Normalize advantage
+  normalize_advantage: true
+  
+  # Target KL divergence
+  target_kl: null
+
+
+# Training Configuration
+# ======================
+training:
+  # Total timesteps to train
+  total_timesteps: 1000000
+  
+  # Random seed
+  seed: 42
+  
+  # TensorBoard log directory
+  log_dir: logs
+  
+  # Model checkpoint directory
+  model_dir: models
+  
+  # Save checkpoint every N timesteps
+  save_freq: 100000
+  
+  # Evaluate every N timesteps (0 to disable)
+  eval_freq: 50000
+  
+  # Number of evaluation episodes
+  n_eval_episodes: 5
+  
+  # Verbose level (0: silent, 1: info, 2: debug)
+  verbose: 1
+
+
+# Evaluation Configuration
+# ========================
+evaluation:
+  # Number of episodes to run
+  n_episodes: 100
+  
+  # Render during evaluation (for visualization)
+  render: false
+  
+  # Save evaluation results
+  save_results: true
+  results_dir: data/evaluation
