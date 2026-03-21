@@ -250,10 +250,10 @@ class FeatureProcessor:
         
         # Transform prices (OHLC)
         prices = self.price_scaler.transform(data[:, :4])
-        
-        # Transform volume
-        volume = self.volume_scaler.transform(data[:, 4:5])
-        
+
+        # Transform volume (flatten for scaler, then reshape)
+        volume = self.volume_scaler.transform(data[:, 4]).reshape(-1, 1)
+
         # Handle optional spread column
         if data.shape[1] >= 6:
             spread = data[:, 5:6].astype(np.float32)

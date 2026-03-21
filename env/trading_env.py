@@ -174,7 +174,11 @@ class TradingEnv(gym.Env):
     @property
     def _price_center(self) -> float:
         """Reference price for normalization."""
-        return float(self.data[0, 3])  # First close price
+        price = float(self.data[0, 3])  # First close price
+        # Handle preprocessed data (log returns close to 0)
+        if abs(price) < 0.01:
+            return 1.0  # Use 1.0 as reference for normalized data
+        return price
     
     def _calculate_reward(self, action: int, closed_trade: Optional[Trade]) -> float:
         """
