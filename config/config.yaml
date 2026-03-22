@@ -64,16 +64,47 @@ reward:
 
 
 
+# Observation Configuration
+# =========================
+observation:
+  # Sparse lag indices — bars back from current step.
+  # [1,2,4,8,24] covers 1h to 24h with exponential spacing.
+  price_lags: [1, 2, 4, 8, 24]
+
+  indicators:
+    rsi:
+      enabled: true
+      period: 14
+
+    atr:
+      enabled: true
+      period: 14
+
+    ema_ratio:
+      enabled: true
+      fast: 8
+      slow: 21
+
+    bollinger:
+      enabled: true
+      period: 20
+      std_dev: 2.0
+
+    momentum:
+      enabled: true
+      periods: [5, 20, 50]   # one feature per period
+
+    session:
+      enabled: true           # hour_sin, hour_cos, dow_sin, dow_cos
+
+
 # ===========================
 preprocessing:
   # Price normalization method: log_return, relative, zscore
   price_method: log_return
-  
+
   # Volume normalization method: log, minmax, zscore
   volume_method: log
-  
-  # Add technical indicators
-  add_technical_indicators: true
 
 
 # PPO Agent Hyperparameters
@@ -85,11 +116,11 @@ agent:
   # Policy network
   policy: MlpPolicy
   
-  # Network architecture
+  # Network architecture — sized for 27-feature obs space
   policy_kwargs:
     net_arch:
-      - 256
-      - 128
+      - 64
+      - 64
   
   # Learning rate
   learning_rate: 0.0003

@@ -21,7 +21,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from core.agent import BaseAgent
 from core.config import load_config, load_symbol_spec
 from core.metrics import calculate_metrics, print_metrics, save_results
-from env.preprocessor import load_csv, load_npy, preprocess
+from env.preprocessor import build_obs_arrays, load_csv, load_npy, preprocess
 from env.trading_env import TradingEnv
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class Evaluator:
     def __init__(self, config_path: str = "config/config.yaml"):
         self.config      = load_config(config_path)
         self.env_cfg     = self.config["environment"]
+        self.obs_cfg     = self.config["observation"]
         self.symbols_cfg = self.config.get("symbols_config", "config/symbols.yaml")
         self._reward_cfg = self.config.get("reward", {})
         self.bars_per_year = int(
@@ -79,9 +80,10 @@ class Evaluator:
         # Load data
         # ------------------------------------------------------------------
         path = Path(data_path)
-        raw_data  = load_npy(path) if path.suffix.lower() == ".npy" else load_csv(path)[0]
+        raw_data, dt_index = load_npy(path) if path.suffix.lower() == ".npy" else load_csv(path)
         processed = preprocess(raw_data)
         raw_close = raw_data[:, 3].astype(np.float64)
+        obs_arrays = build_obs_arrays(raw_data, self.obs_cfg, dt_index)
 
         symbol      = path.stem.upper().split("_")[0]
         symbol_spec = load_symbol_spec(self.symbols_cfg, symbol)
@@ -95,10 +97,10 @@ class Evaluator:
         # ------------------------------------------------------------------
         def _make_env():
             return TradingEnv(
-                data                   = processed,
+                obs_arrays             = obs_arrays,
                 raw_close              = raw_close,
                 symbol_spec            = symbol_spec,
-                window_size            = self.env_cfg["window_size"],
+                obs_config             = self.obs_cfg,
                 initial_balance        = initial_balance,
                 max_positions          = self.env_cfg.get("max_positions", 3),
                 slippage_prob          = self.env_cfg["slippage_prob"],
@@ -106,6 +108,7 @@ class Evaluator:
                 invalid_action_penalty = self._reward_cfg.get("invalid_action_penalty", -0.01),
                 drawdown_penalty_scale = self._reward_cfg.get("drawdown_penalty_scale", 1.0),
                 missed_profit_scale    = self._reward_cfg.get("missed_profit_scale", 0.5),
+                step_reward_scale      = self._reward_cfg.get("step_reward_scale", 0.1),
                 render_mode            = None,
             )
 
@@ -148,7 +151,7 @@ class Evaluator:
                 done = bool(dones[0])
                 info = infos[0]
 
-                price  = inner_env._current_raw_price()
+                price  = inner_env._current_price()
                 equity = inner_env._balance + inner_env._sim.total_unrealized_pnl(price)
                 step_reward = (equity - prev_equity) / initial_balance
                 prev_equity = equity

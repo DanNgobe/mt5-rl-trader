@@ -1,13 +1,21 @@
 """
 Gymnasium environment wrapping the MT5 hedging simulator.
 
-Observation
------------
-    [ohlcv_window (flattened)]  +  [position_slots]  +  [account_state]
+Observation vector (all features configurable via obs_config)
+-------------------------------------------------------------
+    [close_log_returns at sparse lags]   e.g. lags=[1,2,4,8,24]
+    [rsi]                                normalised to [-1, 1]
+    [atr]                                ATR / close (volatility ratio)
+    [ema_ratio]                          EMA(fast)/EMA(slow) - 1
+    [bollinger]                          Bollinger %B normalised [-1,1]
+    [momentum_5, momentum_20, momentum_50]
+    [hour_sin, hour_cos, dow_sin, dow_cos]
+    [position_slots]                     max_positions × 3
+    [balance_norm, equity_norm]
 
-    ohlcv_window   : window_size × n_features  (log-return normalised)
-    position_slots : max_positions × 5
-    account_state  : 2  (balance_norm, equity_norm)
+    Observation dimension is computed dynamically from obs_config +
+    max_positions — changing either in config.yaml automatically resizes
+    the space.
 
 Action space — MultiDiscrete([5, 3])
 -------------------------------------
@@ -16,20 +24,10 @@ Action space — MultiDiscrete([5, 3])
 
 Reward
 ------
-    On trade close:
-        r = pnl_norm
-          - drawdown_penalty_scale * max(0, -mae_pnl) / initial_balance
-          - missed_profit_scale    * max(0, 1 - pnl/mfe_pnl)   [only when mfe_pnl > 0]
-
-    On invalid action (open at cap, close non-existent lot/direction):
-        r = invalid_action_penalty  (flat negative constant)
-
-    Every step (shaping):
-        r += step_reward_scale * unrealized_pnl_delta / initial_balance
-        (rewards positions moving in your favour, penalises deterioration)
-
-    All other steps with no open positions:
-        r = 0.0
+    On open:    -(round_trip_spread_cost) / initial_balance
+    On close:   pnl_norm - drawdown_penalty - missed_profit_penalty
+    On invalid: invalid_action_penalty  (flat negative)
+    Every step: step_reward_scale * unrealized_pnl_delta / initial_balance
 """
 
 import logging
@@ -48,6 +46,7 @@ from core.simulator import (
     SymbolSpec,
     TradeSimulator,
 )
+from env.preprocessor import obs_dim_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +57,10 @@ class TradingEnv(gym.Env):
 
     def __init__(
         self,
-        data:                    np.ndarray,
+        obs_arrays:              dict,
         raw_close:               np.ndarray,
         symbol_spec:             SymbolSpec,
-        window_size:             int   = 10,
+        obs_config:              dict,
         initial_balance:         float = 10_000.0,
         max_positions:           int   = 3,
         slippage_prob:           float = 0.3,
@@ -74,33 +73,34 @@ class TradingEnv(gym.Env):
     ):
         super().__init__()
 
-        if data.ndim != 2:
-            raise ValueError(f"data must be 2-D, got {data.shape}")
-        if len(raw_close) != len(data):
-            raise ValueError(f"raw_close length {len(raw_close)} != data length {len(data)}")
-        if data.shape[0] <= window_size:
-            raise ValueError(f"data has {data.shape[0]} rows but window_size={window_size}")
+        n = len(raw_close)
+        if n < 2:
+            raise ValueError("raw_close must have at least 2 rows")
 
-        self.data            = np.asarray(data,      dtype=np.float32)
+        self.obs_arrays      = obs_arrays
         self.raw_close       = np.asarray(raw_close, dtype=np.float64)
         self.spec            = symbol_spec
-        self.window_size     = window_size
+        self.obs_config      = obs_config
         self.initial_balance = initial_balance
         self.max_positions   = max_positions
         self.render_mode     = render_mode
+        self.n_samples       = n
 
         self.invalid_action_penalty = invalid_action_penalty
         self.drawdown_penalty_scale = drawdown_penalty_scale
         self.missed_profit_scale    = missed_profit_scale
         self.step_reward_scale      = step_reward_scale
 
-        self.n_samples, self.n_features = self.data.shape
+        # Sparse lag indices (bars back from current step)
+        self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
+        # Minimum step needed so all lags are valid
+        self._min_step = max(self._price_lags)
 
-        self.action_space = spaces.MultiDiscrete([5, 3])
-        obs_dim = window_size * self.n_features + max_positions * 5 + 2
+        obs_dim = obs_dim_from_config(obs_config, max_positions)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
+        self.action_space = spaces.MultiDiscrete([5, 3])
 
         self._sim = TradeSimulator(
             symbol_spec    = symbol_spec,
@@ -109,25 +109,30 @@ class TradingEnv(gym.Env):
             slippage_range = slippage_range,
         )
 
-        self._step:           int              = 0
-        self._balance:        float            = initial_balance
+        self._step:           int               = 0
+        self._balance:        float             = initial_balance
+        self._prev_unrealized: float            = 0.0
         self._episode_trades: list[ClosedTrade] = []
+
+    # ------------------------------------------------------------------
+    # Gym interface
+    # ------------------------------------------------------------------
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        self._sim._rng         = self.np_random
+        self._sim._rng        = self.np_random
         self._sim.reset()
-        self._step             = self.window_size
-        self._balance          = self.initial_balance
-        self._episode_trades   = []
-        self._prev_unrealized  = 0.0
+        self._step            = self._min_step
+        self._balance         = self.initial_balance
+        self._prev_unrealized = 0.0
+        self._episode_trades  = []
         return self._observation(), self._info()
 
     def step(self, action: np.ndarray):
         direction_idx, lot_idx = int(action[0]), int(action[1])
         direction_action       = Action(direction_idx)
         lot_size               = LOT_TIERS[lot_idx]
-        current_price          = self._current_raw_price()
+        current_price          = self._current_price()
 
         reward       = 0.0
         closed_trade = None
@@ -154,26 +159,22 @@ class TradingEnv(gym.Env):
                 closed_trade = result.trade
                 self._episode_trades.append(closed_trade)
 
-        # Update MFE/MAE on all open positions after action is resolved
         self._sim.update_excursions(current_price)
 
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
 
-        # Step-level shaping: reward the delta in unrealized PnL each step.
-        # When a position closes, unrealized drops back toward 0, so the
-        # shaping and the close reward don't double-count the same PnL.
+        # Step shaping: reward unrealized PnL improving, penalise deterioration
         reward += self.step_reward_scale * (unrealized - self._prev_unrealized) / self.initial_balance
         self._prev_unrealized = unrealized
 
-        self._step   += 1
-        terminated    = self._is_terminated(equity)
+        self._step += 1
+        terminated  = self._is_terminated(equity)
 
         if terminated and self._sim.has_positions:
-            close_price = self._current_raw_price()
-            forced      = self._sim.close_all(close_price)
-            for trade in forced:
+            close_price = self._current_price()
+            for trade in self._sim.close_all(close_price):
                 self._episode_trades.append(trade)
                 reward += self._order_reward(OrderResult(success=True, trade=trade))
             self._balance         = self.initial_balance + self._sim.cumulative_pnl
@@ -182,7 +183,6 @@ class TradingEnv(gym.Env):
 
         obs  = self._observation()
         info = self._info(closed_trade=closed_trade, equity=equity)
-
         if terminated:
             info["episode_stats"] = self.episode_stats()
 
@@ -191,29 +191,28 @@ class TradingEnv(gym.Env):
     def render(self) -> None:
         if self.render_mode != "human":
             return
-        price  = self._current_raw_price()
+        price  = self._current_price()
         equity = self._balance + self._sim.total_unrealized_pnl(price)
         print(
             f"[{self.spec.name}] step={self._step}/{self.n_samples}  "
             f"balance={self._balance:.2f}  equity={equity:.2f}  "
-            f"open_positions={self._sim.n_positions}"
+            f"positions={self._sim.n_positions}"
         )
 
     def close(self) -> None:
         pass
 
+    # ------------------------------------------------------------------
+    # Episode stats
+    # ------------------------------------------------------------------
+
     def episode_stats(self) -> dict:
         trades = self._episode_trades
         if not trades:
             return {
-                "total_trades":  0,
-                "winning_trades": 0,
-                "losing_trades":  0,
-                "win_rate":      0.0,
-                "total_pnl":     0.0,
-                "avg_pnl":       0.0,
-                "max_drawdown":  0.0,
-                "final_balance": self._balance,
+                "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
+                "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
+                "max_drawdown": 0.0, "final_balance": self._balance,
             }
         pnls   = np.array([t.pnl for t in trades])
         wins   = int((pnls > 0).sum())
@@ -230,40 +229,96 @@ class TradingEnv(gym.Env):
             "final_balance":  self._balance,
         }
 
-    def _order_reward(self, result: OrderResult) -> float:
-        """Compute reward from an OrderResult.
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
 
-        On open:  small negative equal to the estimated round-trip spread cost.
-        On close: PnL normalised by initial balance, minus MAE and capture penalties.
-        Invalid:  flat invalid_action_penalty.
+    def _order_reward(self, result: OrderResult) -> float:
+        """
+        On open:    charge estimated round-trip spread cost.
+        On close:   PnL norm - MAE penalty - missed profit penalty.
+        Invalid:    flat penalty.
         """
         if result.invalid:
             return self.invalid_action_penalty
 
         if result.trade is None:
-            # Charge the round-trip spread cost upfront (x2: open + anticipated close).
-            # Small negative that makes the agent aware entry has a cost to overcome.
+            # Charge round-trip spread upfront (open + anticipated close)
             return -(result.position.spread_paid * 2.0) / self.initial_balance
 
-        t   = result.trade
-        ib  = self.initial_balance
+        t  = result.trade
+        ib = self.initial_balance
 
         pnl_norm         = t.pnl / ib
         drawdown_penalty = self.drawdown_penalty_scale * max(0.0, -t.mae_pnl) / ib
 
-        # Missed profit: penalise poor capture of available upside.
-        # Only fires when MFE was positive (there was profit to capture).
-        # Uses capture ratio so the penalty is proportional to how much
-        # of the move was left on the table, not the raw dollar gap.
         if t.mfe_pnl > 0:
-            capture_ratio  = t.pnl / t.mfe_pnl  # 1.0 = perfect, <1 = left money
+            capture_ratio  = t.pnl / t.mfe_pnl
             missed_penalty = self.missed_profit_scale * max(0.0, 1.0 - capture_ratio)
         else:
             missed_penalty = 0.0
 
         return pnl_norm - drawdown_penalty - missed_penalty
 
-    def _current_raw_price(self) -> float:
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
+
+    def _observation(self) -> np.ndarray:
+        parts = []
+        t     = min(self._step, self.n_samples - 1)  # Clamp to valid index range
+        ind   = self.obs_config.get("indicators", {})
+
+        # 1. Sparse lagged close log returns
+        close_lr = self.obs_arrays["close_log_returns"]
+        for lag in self._price_lags:
+            idx = max(0, t - lag)
+            parts.append(float(close_lr[idx]))
+
+        # 2. Indicators — index current step, fall back to 0 if missing
+        if ind.get("rsi",       {}).get("enabled", True):
+            parts.append(float(self.obs_arrays["rsi"][t]))
+
+        if ind.get("atr",       {}).get("enabled", True):
+            parts.append(float(self.obs_arrays["atr"][t]))
+
+        if ind.get("ema_ratio", {}).get("enabled", True):
+            parts.append(float(self.obs_arrays["ema_ratio"][t]))
+
+        if ind.get("bollinger", {}).get("enabled", True):
+            parts.append(float(self.obs_arrays["bollinger"][t]))
+
+        if ind.get("momentum",  {}).get("enabled", True):
+            mom = self.obs_arrays["momentum"][t]   # shape (n_periods,)
+            parts.extend(mom.tolist())
+
+        if ind.get("session",   {}).get("enabled", True):
+            parts.extend(self.obs_arrays["session"][t].tolist())
+
+        # 3. Position slots: [direction, lot_norm, unrealized_pnl_norm] × max_positions
+        price = self._current_price()
+        for i in range(self.max_positions):
+            if i < len(self._sim.positions):
+                pos = self._sim.positions[i]
+                parts.append(float(pos.direction))
+                parts.append(pos.lot_size / LOT_TIERS[-1])   # norm to [0,1]
+                parts.append(pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance)
+            else:
+                parts.extend([0.0, 0.0, 0.0])
+
+        # 4. Account state
+        unrealized = self._sim.total_unrealized_pnl(price)
+        equity     = self._balance + unrealized
+        parts.append(self._balance / self.initial_balance)
+        parts.append(equity        / self.initial_balance)
+
+        return np.array(parts, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _current_price(self) -> float:
         return float(self.raw_close[min(self._step, self.n_samples - 1)])
 
     def _is_terminated(self, equity: float) -> bool:
@@ -274,25 +329,9 @@ class TradingEnv(gym.Env):
             return True
         return False
 
-    def _observation(self) -> np.ndarray:
-        start  = max(0, self._step - self.window_size)
-        window = self.data[start:self._step]
-        if len(window) < self.window_size:
-            pad    = np.zeros((self.window_size - len(window), self.n_features), dtype=np.float32)
-            window = np.vstack([pad, window])
-
-        price       = self._current_raw_price()
-        pos_vec     = self._sim.position_state_vector(price, self.max_positions)
-        unrealized  = self._sim.total_unrealized_pnl(price)
-        equity      = self._balance + unrealized
-        account_vec = np.array(
-            [self._balance / self.initial_balance, equity / self.initial_balance],
-            dtype=np.float32,
-        )
-        return np.concatenate([window.flatten(), pos_vec, account_vec])
-
-    def _info(self, closed_trade: Optional[ClosedTrade] = None, equity: Optional[float] = None) -> dict:
-        price = self._current_raw_price()
+    def _info(self, closed_trade: Optional[ClosedTrade] = None,
+              equity: Optional[float] = None) -> dict:
+        price = self._current_price()
         if equity is None:
             equity = self._balance + self._sim.total_unrealized_pnl(price)
         return {

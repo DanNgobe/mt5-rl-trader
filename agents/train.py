@@ -35,19 +35,20 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _make_env_fn(
-    data:        np.ndarray,
+    obs_arrays:  dict,
     raw_close:   np.ndarray,
     symbol_spec,
     env_config:  dict,
     reward_cfg:  dict,
+    obs_cfg:     dict,
     seed:        int,
 ):
     def _init():
         env = TradingEnv(
-            data                   = data,
+            obs_arrays             = obs_arrays,
             raw_close              = raw_close,
             symbol_spec            = symbol_spec,
-            window_size            = env_config["window_size"],
+            obs_config             = obs_cfg,
             initial_balance        = env_config["initial_balance"],
             max_positions          = env_config.get("max_positions", 3),
             slippage_prob          = env_config["slippage_prob"],
@@ -179,6 +180,7 @@ def train(
     train_cfg   = config["training"]
     agent_cfg   = config["agent"]
     reward_cfg  = config.get("reward", {})
+    obs_cfg     = config.get("observation", {})
     symbols_cfg = config.get("symbols_config", "config/symbols.yaml")
 
     if data_dir is None:
@@ -187,7 +189,7 @@ def train(
         total_timesteps = train_cfg["total_timesteps"]
 
     log.info("Loading symbol data from %s (symbols=%s)", data_dir, symbols or "all")
-    symbol_data = load_symbol_files(data_dir, symbols=symbols)
+    symbol_data = load_symbol_files(data_dir, obs_cfg=obs_cfg, symbols=symbols)
     if not symbol_data:
         raise ValueError(f"No data loaded from {data_dir}")
     log.info("Loaded %d symbol(s): %s", len(symbol_data), list(symbol_data.keys()))
@@ -195,20 +197,16 @@ def train(
     env_fns      = []
     eval_env_fns = []
 
-    for i, (symbol, processed) in enumerate(symbol_data.items()):
-        raw_path = Path(data_dir) / f"{symbol}.csv"
-        if not raw_path.exists():
-            raw_path = Path(data_dir) / f"{symbol}.npy"
-
-        if raw_path.suffix == ".csv":
-            import pandas as pd
-            raw_close = pd.read_csv(raw_path)["close"].to_numpy(dtype=np.float64)
-        else:
-            raw_close = np.load(raw_path)[:, 3]
-
+    for i, (symbol, payload) in enumerate(symbol_data.items()):
         spec = load_symbol_spec(symbols_cfg, symbol)
-        env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, reward_cfg, seed + i))
-        eval_env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, reward_cfg, seed + 10_000 + i))
+        env_fns.append(_make_env_fn(
+            payload["obs_arrays"], payload["raw_close"],
+            spec, env_cfg, reward_cfg, obs_cfg, seed + i,
+        ))
+        eval_env_fns.append(_make_env_fn(
+            payload["obs_arrays"], payload["raw_close"],
+            spec, env_cfg, reward_cfg, obs_cfg, seed + 10_000 + i,
+        ))
 
     VecEnvCls = DummyVecEnv if len(env_fns) == 1 else SubprocVecEnv
     vec_env   = VecEnvCls(env_fns)
@@ -249,6 +247,7 @@ def train(
             seed                = seed,
             verbose             = train_cfg["verbose"],
             tensorboard_log     = str(log_dir),
+            device              = "cpu",
         )
 
     callbacks = [

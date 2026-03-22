@@ -223,7 +223,7 @@ class EpisodeVisualiser:
                  When None the action is recorded as HOLD (index 0).
         """
         step  = env._step
-        price = env._current_raw_price()
+        price = env._current_price()
 
         unrealized = env._sim.total_unrealized_pnl(price)
         equity     = env._balance + unrealized
@@ -533,7 +533,7 @@ class EpisodeVisualiser:
         ax_positions.set_facecolor(_PANEL)
         ax_positions.set_title("Open Positions", color=_TEXT, fontsize=9, pad=4)
 
-        price     = env._current_raw_price()
+        price     = env._current_price()
         pos_vec   = env._sim.position_state_vector(price, self._max_positions)
         slot_size = 5
         n_slots   = self._max_positions
