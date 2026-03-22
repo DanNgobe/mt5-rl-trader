@@ -32,6 +32,11 @@ data:
   # Timeframe for data
   timeframe: H1  # H1, H4, D1, etc.
 
+  # Bars per year — used for Sharpe ratio annualisation.
+  # Common values: M1=378000, M5=75600, M15=25200, M30=12600,
+  #                H1=6048, H4=1512, D1=252, W1=52
+  bars_per_year: 6048
+
 
 # Preprocessing Configuration
 # ===========================

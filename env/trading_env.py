@@ -34,7 +34,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .simulator import (
+from core.simulator import (
     Action,
     ClosedTrade,
     Direction,
@@ -254,8 +254,10 @@ class TradingEnv(gym.Env):
         obs  = self._observation()
         info = self._info(closed_trade=closed_trade, equity=equity)
 
-        return obs, float(reward), terminated, truncated, info
+        if terminated:
+            info["episode_stats"] = self.episode_stats()
 
+        return obs, float(reward), terminated, truncated, info
     def render(self) -> None:
         if self.render_mode != "human":
             return

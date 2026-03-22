@@ -5,7 +5,7 @@ Live per-step debugging dashboard for a single TradingEnv episode.
 
 Usage
 -----
-    from env.visualiser import EpisodeVisualiser
+    from core.visualiser import EpisodeVisualiser
 
     vis = EpisodeVisualiser(window=120, pause=0.01)
     obs, _ = env.reset()

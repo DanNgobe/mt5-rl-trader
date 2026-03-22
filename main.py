@@ -121,18 +121,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     log.info("  episodes : %d", args.episodes)
 
     evaluate(
-        model_path   = args.model,
-        data_path    = args.data,
-        config_path  = args.config,
-        n_episodes   = args.episodes,
-        render       = args.render,
-        save_results = not args.no_save,
-        results_dir  = args.output,
-        export_onnx_ = args.export_onnx,
-        onnx_path    = args.onnx_path,
-        visualise    = args.visualise,
-        vis_window   = args.vis_window,
-        vis_pause    = args.vis_pause,
+        model_path    = args.model,
+        data_path     = args.data,
+        config_path   = args.config,
+        n_episodes    = args.episodes,
+        render        = args.render,
+        save_results_ = not args.no_save,
+        results_dir   = args.output,
+        export_onnx_  = args.export_onnx,
+        onnx_path     = args.onnx_path,
+        visualise     = args.visualise,
+        vis_window    = args.vis_window,
+        vis_pause     = args.vis_pause,
     )
     return 0
 
