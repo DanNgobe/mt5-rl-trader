@@ -80,5 +80,9 @@ class BaseAgent(ABC):
         return np.array([2, lot_tier], dtype=np.int32)
 
     @staticmethod
-    def _close(lot_tier: int = 0) -> np.ndarray:
+    def _close_long(lot_tier: int = 0) -> np.ndarray:
         return np.array([3, lot_tier], dtype=np.int32)
+
+    @staticmethod
+    def _close_short(lot_tier: int = 0) -> np.ndarray:
+        return np.array([4, lot_tier], dtype=np.int32)

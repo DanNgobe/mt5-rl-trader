@@ -3,8 +3,9 @@
 //|                    Forex RL Trader — MT5 ONNX deployment         |
 //|                                                                  |
 //| Matches Python environment:                                      |
-//|   Action space : MultiDiscrete([4, 3])                          |
-//|     axis-0 direction : 0=HOLD  1=BUY  2=SELL  3=CLOSE          |
+//|   Action space : MultiDiscrete([5, 3])                          |
+//|     axis-0 direction : 0=HOLD  1=BUY  2=SELL                   |
+//|                        3=CLOSE_LONG  4=CLOSE_SHORT              |
 //|     axis-1 lot_tier  : 0=0.01  1=0.02  2=0.05                  |
 //|   Observation  : [ohlcv_window | position_slots | account]      |
 //|   Preprocessing: log returns on OHLC, z-score on volume         |
@@ -101,7 +102,8 @@ int OnInit()
 
     // MT5 ONNX runtime requires explicit shape when batch dim is dynamic
     ulong in_shape[]  = {1, (ulong)OBS_DIM};
-    ulong out_shape[] = {1, 7};
+    // output shape is now [1, 8]: 5 direction logits + 3 lot logits
+    ulong out_shape[] = {1, 8};
     if(!OnnxSetInputShape(g_onnx_handle, 0, in_shape))
     {
         Print("ERROR: OnnxSetInputShape failed (", GetLastError(), ")");
@@ -115,7 +117,7 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    Print("ONNX loaded OK. obs_dim=", OBS_DIM, "  output=[1,7]");
+    Print("ONNX loaded OK. obs_dim=", OBS_DIM, "  output=[1,8]");
 
     CalibrateVolumeStats();
     return INIT_SUCCEEDED;
@@ -157,15 +159,15 @@ void OnTick()
     float logits[];
     if(!RunInference(obs_buf, logits)) { Print("RunInference failed."); return; }
 
-    int    dir_idx  = ArgMax(logits, 0, 4);
-    int    lot_idx  = ArgMax(logits, 4, 3);
+    int    dir_idx  = ArgMax(logits, 0, 5);
+    int    lot_idx  = ArgMax(logits, 5, 3);
     double lot_size = LOT_TIERS[lot_idx];
 
     Print(StringFormat(
-        "Action: %s  lot=%.2f  logits=[%.3f,%.3f,%.3f,%.3f|%.3f,%.3f,%.3f]",
+        "Action: %s  lot=%.2f  logits=[%.3f,%.3f,%.3f,%.3f,%.3f|%.3f,%.3f,%.3f]",
         DirectionName(dir_idx), lot_size,
-        logits[0], logits[1], logits[2], logits[3],
-        logits[4], logits[5], logits[6]));
+        logits[0], logits[1], logits[2], logits[3], logits[4],
+        logits[5], logits[6], logits[7]));
 
     ExecuteAction(dir_idx, lot_size);
 }
@@ -236,9 +238,8 @@ bool BuildObservation(float &obs_buf[])
 //+------------------------------------------------------------------+
 bool RunInference(const float &obs_buf[], float &logits[])
 {
-    ArrayResize(logits, 7);
+    ArrayResize(logits, 8);
 
-    // OnnxRun needs a writable copy — 'input' is a reserved word in MQL5
     float obs_copy[];
     ArrayResize(obs_copy, OBS_DIM);
     ArrayCopy(obs_copy, obs_buf);
@@ -284,14 +285,17 @@ void ExecuteAction(int dir_idx, double lot_size)
         return;
     }
 
-    if(dir_idx == 3)  // CLOSE
-        CloseOldestMatchingPosition(lot_size);
+    if(dir_idx == 3)  // CLOSE_LONG
+        CloseOldestMatchingPosition(lot_size, POSITION_TYPE_BUY);
+
+    if(dir_idx == 4)  // CLOSE_SHORT
+        CloseOldestMatchingPosition(lot_size, POSITION_TYPE_SELL);
 }
 
 //+------------------------------------------------------------------+
 //| Close oldest position matching lot_size (FIFO)                   |
 //+------------------------------------------------------------------+
-void CloseOldestMatchingPosition(double lot_size)
+void CloseOldestMatchingPosition(double lot_size, ENUM_POSITION_TYPE pos_type)
 {
     ulong    best_ticket = 0;
     datetime best_time   = D'3000.01.01';
@@ -301,19 +305,21 @@ void CloseOldestMatchingPosition(double lot_size)
     {
         ulong ticket = PositionGetTicket(i);
         if(ticket == 0) continue;
-        if(PositionGetString(POSITION_SYMBOL)         != _Symbol)        continue;
-        if((int)PositionGetInteger(POSITION_MAGIC)    != InpMagicNumber) continue;
-        if(MathAbs(PositionGetDouble(POSITION_VOLUME) - lot_size) > 1e-9) continue;
+        if(PositionGetString(POSITION_SYMBOL)              != _Symbol)        continue;
+        if((int)PositionGetInteger(POSITION_MAGIC)         != InpMagicNumber) continue;
+        if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != pos_type) continue;
+        if(MathAbs(PositionGetDouble(POSITION_VOLUME) - lot_size) > 1e-9)     continue;
 
         datetime t = (datetime)PositionGetInteger(POSITION_TIME);
         if(t < best_time) { best_time = t; best_ticket = ticket; }
     }
 
+    string type_str = (pos_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
     if(best_ticket == 0)
-        { Print(StringFormat("CLOSE %.2f: no match.", lot_size)); return; }
+        { Print(StringFormat("CLOSE_%s %.2f: no match.", type_str, lot_size)); return; }
 
     if(g_trade.PositionClose(best_ticket))
-        Print(StringFormat("CLOSE ticket=%d lot=%.2f", (int)best_ticket, lot_size));
+        Print(StringFormat("CLOSE_%s ticket=%d lot=%.2f", type_str, (int)best_ticket, lot_size));
     else
         Print("CLOSE failed: ", g_trade.ResultRetcodeDescription());
 }
@@ -404,7 +410,8 @@ string DirectionName(int idx)
     if(idx==0) return "HOLD";
     if(idx==1) return "BUY";
     if(idx==2) return "SELL";
-    if(idx==3) return "CLOSE";
+    if(idx==3) return "CLOSE_LONG";
+    if(idx==4) return "CLOSE_SHORT";
     return "UNKNOWN";
 }
 //+------------------------------------------------------------------+

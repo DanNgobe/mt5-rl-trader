@@ -62,7 +62,7 @@ class RandomStrategy(BaseStrategy):
         pass
 
     def act(self, env: "TradingEnv") -> np.ndarray:
-        direction = int(self._rng.integers(0, 4))   # 0-3 inclusive
+        direction = int(self._rng.integers(0, 5))   # 0-4 inclusive
         return np.array([direction, self._lot_tier], dtype=np.int32)
 
 
@@ -155,20 +155,18 @@ class MACrossStrategy(BaseStrategy):
         positions   = env._sim.positions
 
         if crossover_up:
-            # Close any open SHORT before going long
             has_short = any(p.direction.name == "SHORT" for p in positions)
             if has_short:
                 self._pending_action = self._buy(self._lot_tier)
-                return self._close(self._lot_tier)
+                return self._close_short(self._lot_tier)
             elif n_positions == 0:
                 return self._buy(self._lot_tier)
 
         elif crossover_down:
-            # Close any open LONG before going short
             has_long = any(p.direction.name == "LONG" for p in positions)
             if has_long:
                 self._pending_action = self._sell(self._lot_tier)
-                return self._close(self._lot_tier)
+                return self._close_long(self._lot_tier)
             elif n_positions == 0:
                 return self._sell(self._lot_tier)
 

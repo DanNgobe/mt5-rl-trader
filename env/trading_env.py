@@ -9,9 +9,9 @@ Observation
     position_slots : max_positions × 5
     account_state  : 2  (balance_norm, equity_norm)
 
-Action space — MultiDiscrete([4, 3])
+Action space — MultiDiscrete([5, 3])
 -------------------------------------
-    axis-0  direction : 0=HOLD  1=BUY  2=SELL  3=CLOSE
+    axis-0  direction : 0=HOLD  1=BUY  2=SELL  3=CLOSE_LONG  4=CLOSE_SHORT
     axis-1  lot_tier  : 0=0.01  1=0.02  2=0.05
 
 Reward — sparse, fires only on trade close or invalid action
@@ -21,7 +21,7 @@ Reward — sparse, fires only on trade close or invalid action
           - drawdown_penalty_scale  * max(0, -mae_pnl) / initial_balance
           - missed_profit_scale     * max(0, mfe_pnl - pnl) / initial_balance
 
-    On invalid action (open at cap, close non-existent lot):
+    On invalid action (open at cap, close non-existent lot/direction):
         r = invalid_action_penalty  (flat negative constant)
 
     All other steps:
@@ -90,7 +90,7 @@ class TradingEnv(gym.Env):
 
         self.n_samples, self.n_features = self.data.shape
 
-        self.action_space = spaces.MultiDiscrete([4, 3])
+        self.action_space = spaces.MultiDiscrete([5, 3])
         obs_dim = window_size * self.n_features + max_positions * 5 + 2
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -133,8 +133,15 @@ class TradingEnv(gym.Env):
             result = self._sim.open_position(current_price, Direction.SHORT, lot_size)
             reward = self._order_reward(result)
 
-        elif direction_action == Action.CLOSE:
-            result = self._sim.close_position(current_price, lot_size)
+        elif direction_action == Action.CLOSE_LONG:
+            result = self._sim.close_position(current_price, Direction.LONG, lot_size)
+            reward = self._order_reward(result)
+            if result.trade is not None:
+                closed_trade = result.trade
+                self._episode_trades.append(closed_trade)
+
+        elif direction_action == Action.CLOSE_SHORT:
+            result = self._sim.close_position(current_price, Direction.SHORT, lot_size)
             reward = self._order_reward(result)
             if result.trade is not None:
                 closed_trade = result.trade

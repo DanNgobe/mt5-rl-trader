@@ -22,10 +22,11 @@ class Direction(IntEnum):
 
 
 class Action(IntEnum):
-    HOLD  = 0
-    BUY   = 1
-    SELL  = 2
-    CLOSE = 3
+    HOLD        = 0
+    BUY         = 1
+    SELL        = 2
+    CLOSE_LONG  = 3
+    CLOSE_SHORT = 4
 
 
 LOT_TIERS: list[float] = [0.01, 0.02, 0.05]
@@ -234,15 +235,19 @@ class TradeSimulator:
         logger.debug("Opened %s ticket=%d lot=%.2f entry=%.5f", direction.name, pos.ticket, lot_size, fill)
         return OrderResult(success=True, position=pos)
 
-    def close_position(self, market_price: float, lot_size: float) -> OrderResult:
+    def close_position(self, market_price: float, direction: Direction, lot_size: float) -> OrderResult:
         """
-        Close the oldest open position matching lot_size.
+        Close the oldest open position matching both direction and lot_size.
 
         Returns OrderResult(invalid=True) if no matching position exists.
         """
-        target = next((p for p in self._positions if abs(p.lot_size - lot_size) < 1e-9), None)
+        target = next(
+            (p for p in self._positions
+             if p.direction == direction and abs(p.lot_size - lot_size) < 1e-9),
+            None,
+        )
         if target is None:
-            logger.debug("CLOSE %.2f lots: no matching position.", lot_size)
+            logger.debug("CLOSE_%s %.2f lots: no matching position.", direction.name, lot_size)
             return OrderResult(success=False, invalid=True, reason="no_matching_lot")
 
         fill, spread_paid, slippage = self._fill_close(market_price, target.direction)
@@ -273,7 +278,7 @@ class TradeSimulator:
         """Close every open position. Used at episode end."""
         trades = []
         for pos in list(self._positions):
-            result = self.close_position(market_price, pos.lot_size)
+            result = self.close_position(market_price, pos.direction, pos.lot_size)
             if result.trade is not None:
                 trades.append(result.trade)
         return trades
