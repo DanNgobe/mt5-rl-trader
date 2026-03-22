@@ -1,11 +1,15 @@
 """
-Training script for forex RL agent using Stable-Baselines3 PPO.
+Training script for the forex RL agent using Stable-Baselines3 PPO.
 
-Loads configuration from YAML, prepares data, and trains the agent
-with TensorBoard logging and model checkpointing.
+Expects:
+    data/raw/EURUSD.csv, USDJPY.csv, ...  (or a single file)
+
+Each file is loaded and preprocessed independently (log returns + per-file
+volume z-score) then the agent is trained across all of them via
+SubprocVecEnv — one environment per symbol.
 """
 
-import argparse
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -19,356 +23,322 @@ from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     EvalCallback,
 )
-from stable_baselines3.common.logger import configure
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from torch import nn
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from env.preprocessor import FeatureProcessor
+from env.preprocessor import load_symbol_files, preprocess, load_and_preprocess
 from env.trading_env import TradingEnv
+from env.simulator import SymbolSpec
+
+log = logging.getLogger(__name__)
 
 
-class TradingCallback(BaseCallback):
+# ---------------------------------------------------------------------------
+# Symbols config loader
+# ---------------------------------------------------------------------------
+
+def load_symbol_spec(symbols_config_path: str, symbol: str) -> SymbolSpec:
     """
-    Custom callback for logging trading-specific metrics during training.
+    Build a SymbolSpec from the symbols YAML config for a given symbol.
+
+    Falls back to EURUSD defaults if the symbol is not found.
     """
+    # Strip timeframe suffix (e.g., EURUSD_H1 -> EURUSD)
+    symbol_base = symbol.upper().split("_")[0]
     
+    path = Path(symbols_config_path)
+    if path.exists():
+        with open(path) as f:
+            cfg = yaml.safe_load(f)
+        spec_raw = cfg.get("symbols", {}).get(symbol_base)
+    else:
+        spec_raw = None
+
+    if spec_raw is None:
+        log.warning(
+            "Symbol %s not found in %s — using EURUSD defaults.",
+            symbol_base, symbols_config_path,
+        )
+        spec_raw = {
+            "pip_value": 0.0001,
+            "pip_location": 4,
+            "contract_size": 100_000,
+            "typical_spread_pips": 1.0,
+            "min_lot": 0.01,
+            "max_lot": 100.0,
+            "margin_requirement": 0.01,
+        }
+
+    return SymbolSpec(
+        name          = symbol.upper(),
+        pip_value     = float(spec_raw["pip_value"]),
+        pip_location  = int(spec_raw["pip_location"]),
+        contract_size = int(spec_raw["contract_size"]),
+        spread_pips   = float(spec_raw["typical_spread_pips"]),
+        min_lot       = float(spec_raw["min_lot"]),
+        max_lot       = float(spec_raw["max_lot"]),
+        margin_rate   = float(spec_raw["margin_requirement"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment factory
+# ---------------------------------------------------------------------------
+
+def make_env_fn(
+    data:        np.ndarray,
+    raw_close:   np.ndarray,
+    symbol_spec: SymbolSpec,
+    env_config:  dict,
+    seed:        int,
+):
+    """Return a callable that creates a TradingEnv (required by VecEnv)."""
+    def _init():
+        env = TradingEnv(
+            data            = data,
+            raw_close       = raw_close,
+            symbol_spec     = symbol_spec,
+            window_size     = env_config["window_size"],
+            initial_balance = env_config["initial_balance"],
+            max_positions   = env_config.get("max_positions", 3),
+            slippage_prob   = env_config["slippage_prob"],
+            slippage_range  = tuple(env_config["slippage_range"]),
+            render_mode     = None,
+        )
+        env.reset(seed=seed)
+        return env
+    return _init
+
+
+# ---------------------------------------------------------------------------
+# Callback
+# ---------------------------------------------------------------------------
+
+class TradingMetricsCallback(BaseCallback):
+    """
+    Logs trading-specific metrics to TensorBoard at the end of each rollout.
+
+    Metrics logged:
+        trading/mean_episode_pnl
+        trading/mean_win_rate
+        trading/mean_trades_per_episode
+        trading/mean_max_drawdown
+    """
+
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
-        self.episode_rewards: list[float] = []
-        self.episode_lengths: list[int] = []
-        self.episode_trades: list[int] = []
-    
+        self._episode_stats: list[dict] = []
+
     def _on_step(self) -> bool:
-        """Called at each step."""
+        # Collect episode stats whenever an episode finishes
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            # SB3 stores episode info under the "episode" key when it ends
+            if "episode" in info:
+                # Pull stats directly from the env if accessible
+                env = self.training_env
+                # unwrap DummyVecEnv / SubprocVecEnv
+                if hasattr(env, "envs"):
+                    for e in env.envs:
+                        if hasattr(e, "episode_stats"):
+                            self._episode_stats.append(e.episode_stats())
         return True
-    
+
     def _on_rollout_end(self) -> None:
-        """Called at the end of each rollout (before update)."""
-        # Log rollout statistics
-        if len(self.episode_rewards) > 0:
-            self.logger.record("trading/avg_episode_reward", np.mean(self.episode_rewards))
-            self.logger.record("trading/avg_episode_length", np.mean(self.episode_lengths))
-            self.logger.record("trading/avg_trades_per_episode", np.mean(self.episode_trades))
-        
-        # Reset for next rollout
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_trades = []
-    
-    def _on_episode_end(self) -> None:
-        """Called at the end of each episode."""
-        # Extract episode info from environment
-        if hasattr(self.training_env, "envs") and len(self.training_env.envs) > 0:
-            env = self.training_env.envs[0]
-            if hasattr(env, "get_episode_stats"):
-                stats = env.get_episode_stats()
-                self.episode_rewards.append(stats.get("total_pnl", 0))
-                self.episode_lengths.append(self.num_timesteps)
-                self.episode_trades.append(stats.get("total_trades", 0))
+        if not self._episode_stats:
+            return
+
+        pnls      = [s["total_pnl"]    for s in self._episode_stats]
+        win_rates = [s["win_rate"]      for s in self._episode_stats]
+        trades    = [s["total_trades"]  for s in self._episode_stats]
+        dds       = [s["max_drawdown"]  for s in self._episode_stats]
+
+        self.logger.record("trading/mean_episode_pnl",       float(np.mean(pnls)))
+        self.logger.record("trading/mean_win_rate",           float(np.mean(win_rates)))
+        self.logger.record("trading/mean_trades_per_episode", float(np.mean(trades)))
+        self.logger.record("trading/mean_max_drawdown",       float(np.mean(dds)))
+
+        self._episode_stats.clear()
 
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-
-def load_data(data_path: str) -> np.ndarray:
-    """
-    Load OHLCV data from numpy file.
-    
-    Args:
-        data_path: Path to data file (.npy or .npz)
-        
-    Returns:
-        OHLCV data array
-    """
-    path = Path(data_path)
-    
-    if path.suffix == ".npy":
-        return np.load(path)
-    elif path.suffix == ".npz":
-        data = np.load(path)
-        return data["data"] if "data" in data else data[list(data.files)[0]]
-    else:
-        raise ValueError(f"Unsupported file format: {path.suffix}")
-
-
-def create_env(
-    data: np.ndarray,
-    config: dict,
-    seed: Optional[int] = None,
-) -> TradingEnv:
-    """
-    Create trading environment from configuration.
-    
-    Args:
-        data: OHLCV data array
-        config: Environment configuration
-        seed: Random seed
-        
-    Returns:
-        TradingEnv instance
-    """
-    env_config = config["environment"]
-    
-    return TradingEnv(
-        data=data,
-        window_size=env_config["window_size"],
-        initial_balance=env_config["initial_balance"],
-        spread=env_config["spread"],
-        slippage_prob=env_config["slippage_prob"],
-        slippage_range=tuple(env_config["slippage_range"]),
-        render_mode=None,
-    )
-
-
-def build_ppo_model(
-    env,
-    config: dict,
-    log_dir: str,
-    seed: Optional[int] = None,
-) -> PPO:
-    """
-    Build PPO model from configuration.
-    
-    Args:
-        env: Trading environment
-        config: Full configuration dict
-        log_dir: Directory for TensorBoard logs
-        seed: Random seed
-        
-    Returns:
-        PPO model
-    """
-    agent_config = config["agent"]
-    training_config = config["training"]
-    
-    # Build policy kwargs
-    policy_kwargs = {}
-    if "policy_kwargs" in agent_config:
-        policy_kwargs["net_arch"] = agent_config["policy_kwargs"]["net_arch"]
-    
-    # Create model
-    model = PPO(
-        policy=agent_config["policy"],
-        env=env,
-        learning_rate=agent_config["learning_rate"],
-        n_steps=agent_config["n_steps"],
-        batch_size=agent_config["batch_size"],
-        n_epochs=agent_config["n_epochs"],
-        gamma=agent_config["gamma"],
-        gae_lambda=agent_config["gae_lambda"],
-        clip_range=agent_config["clip_range"],
-        ent_coef=agent_config["ent_coef"],
-        vf_coef=agent_config["vf_coef"],
-        max_grad_norm=agent_config["max_grad_norm"],
-        clip_range_vf=agent_config.get("clip_range_vf"),
-        normalize_advantage=agent_config.get("normalize_advantage", True),
-        target_kl=agent_config.get("target_kl"),
-        policy_kwargs=policy_kwargs,
-        seed=seed,
-        verbose=training_config["verbose"],
-        tensorboard_log=log_dir,
-    )
-    
-    # Configure logger
-    new_logger = configure(log_dir, ["stdout", "csv", "tensorboard"])
-    model.set_logger(new_logger)
-    
-    return model
-
+# ---------------------------------------------------------------------------
+# Main train function
+# ---------------------------------------------------------------------------
 
 def train(
-    config_path: str = "config/config.yaml",
-    data_path: Optional[str] = None,
-    model_path: Optional[str] = None,
-    output_dir: str = "models",
-    total_timesteps: Optional[int] = None,
-    seed: int = 42,
+    config_path:     str            = "config/config.yaml",
+    data_dir:        Optional[str]  = None,
+    symbols:         Optional[list[str]] = None,
+    model_path:      Optional[str]  = None,
+    output_dir:      str            = "models",
+    total_timesteps: Optional[int]  = None,
+    seed:            int            = 42,
 ) -> PPO:
     """
-    Main training function.
-    
+    Load data, build environments, and train the PPO agent.
+
     Args:
-        config_path: Path to configuration YAML
-        data_path: Path to OHLCV data file
-        model_path: Path to existing model to continue training
-        output_dir: Directory to save trained model
-        total_timesteps: Override total timesteps from config
-        seed: Random seed
-        
-    Returns:
-        Trained PPO model
+        config_path:     Path to config/config.yaml.
+        data_dir:        Directory containing SYMBOL.csv files.
+                         Overrides config if provided.
+        symbols:         Whitelist of symbols to train on.
+                         If None, all files in data_dir are used.
+        model_path:      Existing model to continue training from.
+        output_dir:      Directory for checkpoints and final model.
+        total_timesteps: Overrides config value if provided.
+        seed:            Master random seed.
     """
-    # Load configuration
-    print(f"Loading configuration from {config_path}")
-    config = load_config(config_path)
-    
-    # Set defaults
-    if data_path is None:
-        data_path = config["data"]["raw_data_dir"]
-    
-    training_config = config["training"]
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+    log.info("Loading config from %s", config_path)
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    env_cfg      = config["environment"]
+    train_cfg    = config["training"]
+    agent_cfg    = config["agent"]
+
+    if data_dir is None:
+        data_dir = config["data"]["raw_data_dir"]
     if total_timesteps is None:
-        total_timesteps = training_config["total_timesteps"]
-    
-    # Set random seeds
-    np.random.seed(seed)
-    
-    # Load data
-    print(f"Loading data from {data_path}")
-    data = load_data(data_path)
-    print(f"Data shape: {data.shape}")
-    
-    # Preprocess data
-    print("Preprocessing data...")
-    preproc_config = config["preprocessing"]
-    processor = FeatureProcessor(
-        price_method=preproc_config["price_method"],
-        volume_method=preproc_config["volume_method"],
-        add_technical_indicators=preproc_config["add_technical_indicators"],
-    )
-    processed_data = processor.fit_transform(data)
-    print(f"Processed data shape: {processed_data.shape}")
-    
-    # Create directories
+        total_timesteps = train_cfg["total_timesteps"]
+
+    symbols_config = config.get("symbols_config", "config/symbols.yaml")
+
+    # ------------------------------------------------------------------
+    # Load and preprocess all symbol files
+    # ------------------------------------------------------------------
+    log.info("Loading symbol data from %s (symbols=%s)", data_dir, symbols or "all")
+    symbol_data = load_symbol_files(data_dir, symbols=symbols)
+
+    if not symbol_data:
+        raise ValueError(f"No data loaded from {data_dir}")
+
+    log.info("Loaded %d symbol(s): %s", len(symbol_data), list(symbol_data.keys()))
+
+    # ------------------------------------------------------------------
+    # Build one env per symbol for vectorised training
+    # ------------------------------------------------------------------
+    env_fns = []
+    eval_env_fns = []
+
+    for i, (symbol, processed) in enumerate(symbol_data.items()):
+        # Load the raw close prices alongside the processed data
+        raw_path  = Path(data_dir) / f"{symbol}.csv"
+        if not raw_path.exists():
+            raw_path = Path(data_dir) / f"{symbol}.npy"
+
+        if raw_path.suffix == ".csv":
+            import pandas as pd
+            raw_close = pd.read_csv(raw_path)["close"].to_numpy(dtype=np.float64)
+        else:
+            raw_close = np.load(raw_path)[:, 3]  # column 3 = close
+
+        spec = load_symbol_spec(symbols_config, symbol)
+
+        env_fns.append(make_env_fn(processed, raw_close, spec, env_cfg, seed + i))
+        # Separate seed offset for eval envs
+        eval_env_fns.append(make_env_fn(processed, raw_close, spec, env_cfg, seed + 10_000 + i))
+
+    # Use SubprocVecEnv for multiple symbols, DummyVecEnv for one
+    if len(env_fns) == 1:
+        vec_env  = DummyVecEnv(env_fns)
+        eval_env = DummyVecEnv(eval_env_fns)
+    else:
+        vec_env  = SubprocVecEnv(env_fns)
+        eval_env = SubprocVecEnv(eval_env_fns)
+
+    # ------------------------------------------------------------------
+    # Directories
+    # ------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path(training_config["log_dir"]) / f"ppo_{timestamp}"
+    log_dir   = Path(train_cfg["log_dir"]) / f"ppo_{timestamp}"
     model_dir = Path(output_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create environment
-    print("Creating environment...")
-    env = create_env(processed_data, config, seed=seed)
-    env = DummyVecEnv([lambda: env])
-    
-    # Optionally wrap with VecNormalize for reward normalization
-    # env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-    
-    # Build or load model
+
+    # ------------------------------------------------------------------
+    # Build or load PPO model
+    # ------------------------------------------------------------------
+    policy_kwargs = {}
+    if "policy_kwargs" in agent_cfg:
+        policy_kwargs["net_arch"] = agent_cfg["policy_kwargs"]["net_arch"]
+
     if model_path is not None:
-        print(f"Loading existing model from {model_path}")
-        model = PPO.load(model_path, env=env)
+        log.info("Continuing training from %s", model_path)
+        model = PPO.load(model_path, env=vec_env)
     else:
-        print("Building new PPO model...")
-        model = build_ppo_model(env, config, str(log_dir), seed=seed)
-    
-    # Create callbacks
-    callbacks = []
-    
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(
-        save_freq=training_config["save_freq"],
-        save_path=str(model_dir),
-        name_prefix="ppo_trading",
-        verbose=1,
-    )
-    callbacks.append(checkpoint_callback)
-    
-    # Custom trading callback
-    trading_callback = TradingCallback(verbose=1)
-    callbacks.append(trading_callback)
-    
-    # Eval callback (optional)
-    if training_config.get("eval_freq", 0) > 0:
-        eval_env = create_env(processed_data, config, seed=seed + 1000)
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=str(model_dir),
-            log_path=str(log_dir),
-            eval_freq=training_config["eval_freq"],
-            n_eval_episodes=training_config["n_eval_episodes"],
-            deterministic=True,
-            verbose=1,
+        log.info("Building new PPO model.")
+        model = PPO(
+            policy             = agent_cfg["policy"],
+            env                = vec_env,
+            learning_rate      = agent_cfg["learning_rate"],
+            n_steps            = agent_cfg["n_steps"],
+            batch_size         = agent_cfg["batch_size"],
+            n_epochs           = agent_cfg["n_epochs"],
+            gamma              = agent_cfg["gamma"],
+            gae_lambda         = agent_cfg["gae_lambda"],
+            clip_range         = agent_cfg["clip_range"],
+            ent_coef           = agent_cfg["ent_coef"],
+            vf_coef            = agent_cfg["vf_coef"],
+            max_grad_norm      = agent_cfg["max_grad_norm"],
+            clip_range_vf      = agent_cfg.get("clip_range_vf"),
+            normalize_advantage= agent_cfg.get("normalize_advantage", True),
+            target_kl          = agent_cfg.get("target_kl"),
+            policy_kwargs      = policy_kwargs,
+            seed               = seed,
+            verbose            = train_cfg["verbose"],
+            tensorboard_log    = str(log_dir),
         )
-        callbacks.append(eval_callback)
-    
-    # Train model
-    print(f"Starting training for {total_timesteps} timesteps...")
-    print(f"Logs will be saved to: {log_dir}")
-    print(f"Checkpoints will be saved to: {model_dir}")
-    print("-" * 50)
-    
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+    callbacks = [
+        CheckpointCallback(
+            save_freq   = max(train_cfg["save_freq"] // len(env_fns), 1),
+            save_path   = str(model_dir),
+            name_prefix = "ppo_trading",
+            verbose     = 1,
+        ),
+        TradingMetricsCallback(verbose=1),
+    ]
+
+    if train_cfg.get("eval_freq", 0) > 0:
+        callbacks.append(
+            EvalCallback(
+                eval_env,
+                best_model_save_path = str(model_dir),
+                log_path             = str(log_dir),
+                eval_freq            = max(train_cfg["eval_freq"] // len(env_fns), 1),
+                n_eval_episodes      = train_cfg["n_eval_episodes"],
+                deterministic        = True,
+                verbose              = 1,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Train
+    # ------------------------------------------------------------------
+    log.info(
+        "Training for %d timesteps across %d environment(s). Logs → %s",
+        total_timesteps, len(env_fns), log_dir,
+    )
+
     model.learn(
-        total_timesteps=total_timesteps,
-        callback=callbacks,
-        tb_log_name="PPO",
+        total_timesteps = total_timesteps,
+        callback        = callbacks,
+        tb_log_name     = "PPO",
     )
-    
-    # Save final model
-    final_model_path = model_dir / "ppo_trading_final.zip"
-    model.save(str(final_model_path))
-    print(f"\nFinal model saved to: {final_model_path}")
-    
-    # Save preprocessor for inference
-    preprocessor_path = model_dir / "preprocessor.npy"
-    np.save(preprocessor_path, {
-        "price_reference": processor.price_scaler.reference_price,
-        "price_mean": processor.price_scaler.mean,
-        "price_std": processor.price_scaler.std,
-        "volume_min": processor.volume_scaler.min_vol,
-        "volume_max": processor.volume_scaler.max_vol,
-        "volume_mean": processor.volume_scaler.mean_vol,
-        "volume_std": processor.volume_scaler.std_vol,
-    })
-    print(f"Preprocessor saved to: {preprocessor_path}")
-    
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    final_path = model_dir / "ppo_trading_final.zip"
+    model.save(str(final_path))
+    log.info("Final model saved to %s", final_path)
+
+    vec_env.close()
+    eval_env.close()
+
     return model
-
-
-def main():
-    """CLI entry point for training."""
-    parser = argparse.ArgumentParser(description="Train forex RL agent with PPO")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/config.yaml",
-        help="Path to configuration file",
-    )
-    parser.add_argument(
-        "--data",
-        type=str,
-        default=None,
-        help="Path to OHLCV data file (overrides config)",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Path to existing model for continued training",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="models",
-        help="Output directory for trained model",
-    )
-    parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=None,
-        help="Total training timesteps (overrides config)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed",
-    )
-    
-    args = parser.parse_args()
-    
-    train(
-        config_path=args.config,
-        data_path=args.data,
-        model_path=args.model,
-        output_dir=args.output,
-        total_timesteps=args.timesteps,
-        seed=args.seed,
-    )
-
-
-if __name__ == "__main__":
-    main()

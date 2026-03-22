@@ -1,378 +1,384 @@
 """
-Trade simulator for realistic order execution in forex trading.
+Trade simulator modelling MT5 hedging account behaviour.
 
-Models slippage, spread, stop-loss/take-profit breaches, and position lifecycle.
+Supports multiple simultaneous positions per symbol, each with its own
+ticket. No SL/TP — the agent is responsible for all exit decisions.
+Spread and slippage are applied per-symbol using the symbols config.
 """
 
+import logging
+import random
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import IntEnum
 from typing import Optional
 
+import numpy as np
 
-class PositionType(Enum):
-    """Type of trading position."""
-    LONG = auto()
-    SHORT = auto()
+logger = logging.getLogger(__name__)
 
 
-class ActionType(Enum):
-    """Available trading actions."""
-    HOLD = 0
-    BUY = 1
-    SELL = 2
+# ---------------------------------------------------------------------------
+# Enumerations
+# ---------------------------------------------------------------------------
+
+class Direction(IntEnum):
+    LONG  = 1
+    SHORT = -1
+
+
+class Action(IntEnum):
+    HOLD  = 0
+    BUY   = 1
+    SELL  = 2
+    CLOSE = 3
+
+
+LOT_TIERS: list[float] = [0.01, 0.02, 0.05]
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SymbolSpec:
+    """Per-symbol trading specification loaded from symbols config."""
+    name: str
+    pip_value: float        # e.g. 0.0001 for EURUSD, 0.01 for USDJPY
+    pip_location: int       # decimal places for a pip
+    contract_size: int      # units per lot, typically 100_000
+    spread_pips: float      # typical spread in pips
+    min_lot: float
+    max_lot: float
+    margin_rate: float      # e.g. 0.01 for 1:100 leverage
+
+    @property
+    def spread_price(self) -> float:
+        """Spread expressed as a price delta."""
+        return self.spread_pips * self.pip_value
 
 
 @dataclass
 class Position:
-    """Represents an open trading position."""
-    type: PositionType
+    """
+    A single open hedging position, analogous to one MT5 ticket.
+
+    ticket      — unique integer ID for this position
+    direction   — LONG or SHORT
+    lot_size    — position size in lots
+    entry_price — actual fill price after spread/slippage
+    open_price  — raw market price at the time of opening (for reference)
+    """
+    ticket:      int
+    direction:   Direction
+    lot_size:    float
     entry_price: float
-    size: float  # Lot size
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    slippage: float = 0.0
-    spread: float = 0.0
-    
-    def unrealized_pnl(self, current_price: float) -> float:
-        """Calculate unrealized P&L based on current price."""
-        if self.type == PositionType.LONG:
-            return (current_price - self.entry_price) * self.size * 100_000
-        else:  # SHORT
-            return (self.entry_price - current_price) * self.size * 100_000
-    
-    def check_stop_loss(self, current_price: float) -> bool:
-        """Check if stop-loss has been breached."""
-        if self.stop_loss is None:
-            return False
-        if self.type == PositionType.LONG:
-            return current_price <= self.stop_loss
-        else:  # SHORT
-            return current_price >= self.stop_loss
-    
-    def check_take_profit(self, current_price: float) -> bool:
-        """Check if take-profit has been breached."""
-        if self.take_profit is None:
-            return False
-        if self.type == PositionType.LONG:
-            return current_price >= self.take_profit
-        else:  # SHORT
-            return current_price <= self.take_profit
+    open_price:  float
+    spread_paid: float = 0.0
+    slippage:    float = 0.0
+
+    def unrealized_pnl(self, current_price: float, contract_size: int) -> float:
+        """
+        Unrealized P&L in account currency units.
+
+        For a standard lot (100_000 units):
+            P&L = (current - entry) * lots * contract_size   [LONG]
+            P&L = (entry - current) * lots * contract_size   [SHORT]
+        """
+        price_diff = (
+            (current_price - self.entry_price)
+            if self.direction == Direction.LONG
+            else (self.entry_price - current_price)
+        )
+        return price_diff * self.lot_size * contract_size
 
 
 @dataclass
-class Trade:
+class ClosedTrade:
     """Record of a completed trade."""
-    position_type: PositionType
+    ticket:      int
+    direction:   Direction
+    lot_size:    float
     entry_price: float
-    exit_price: float
-    size: float
-    pnl: float
-    slippage: float
-    spread: float
-    exit_reason: str  # 'stop_loss', 'take_profit', 'close', 'reverse'
+    exit_price:  float
+    pnl:         float
+    spread_paid: float
+    slippage:    float
 
+
+# ---------------------------------------------------------------------------
+# Simulator
+# ---------------------------------------------------------------------------
 
 class TradeSimulator:
     """
-    Simulates realistic forex trade execution with slippage, spread,
-    and stop-loss/take-profit breach detection.
+    Simulates MT5 hedging account order execution.
+
+    Key behaviours
+    --------------
+    - Multiple positions can be open simultaneously (hedging mode).
+    - BUY/SELL always opens a new position (never merges with existing).
+    - CLOSE targets the oldest open position matching the requested lot tier.
+      e.g. CLOSE + 0.1 lots → closes the oldest 0.1-lot position regardless
+      of direction, matching the hybrid action semantics agreed with the user.
+    - Spread is applied at fill time; slippage is probabilistic and adverse.
+    - No SL/TP logic — the agent decides all exits.
     """
-    
+
     def __init__(
         self,
-        spread: float = 0.0001,
+        symbol_spec: SymbolSpec,
+        max_positions: int = 3,
         slippage_prob: float = 0.3,
         slippage_range: tuple[float, float] = (0.00001, 0.0005),
+        rng: Optional[np.random.Generator] = None,
     ):
         """
-        Initialize the trade simulator.
-        
         Args:
-            spread: Fixed spread in price units (e.g., 0.0001 for 1 pip on EURUSD)
-            slippage_prob: Probability of slippage occurring on order execution
-            slippage_range: Min and max slippage when it occurs
+            symbol_spec:    Instrument specification (spread, pip value, etc.)
+            max_positions:  Hard cap on simultaneous open positions.
+            slippage_prob:  Probability that slippage occurs on any fill.
+            slippage_range: (min, max) slippage in price units when it fires.
+            rng:            NumPy random generator for reproducibility.
+                            If None, a fresh default_rng() is used.
         """
-        self.spread = spread
-        self.slippage_prob = slippage_prob
+        self.spec           = symbol_spec
+        self.max_positions  = max_positions
+        self.slippage_prob  = slippage_prob
         self.slippage_range = slippage_range
-        
-        self._position: Optional[Position] = None
-        self._trade_history: list[Trade] = []
-        self._cumulative_pnl: float = 0.0
-    
+        self._rng           = rng if rng is not None else np.random.default_rng()
+
+        self._positions:     list[Position]    = []
+        self._closed_trades: list[ClosedTrade] = []
+        self._next_ticket:   int               = 1
+        self._cumulative_pnl: float            = 0.0
+
+    # ------------------------------------------------------------------
+    # Public read-only properties
+    # ------------------------------------------------------------------
+
     @property
-    def position(self) -> Optional[Position]:
-        """Get current open position."""
-        return self._position
-    
+    def positions(self) -> list[Position]:
+        return list(self._positions)
+
     @property
-    def has_position(self) -> bool:
-        """Check if there's an open position."""
-        return self._position is not None
-    
+    def n_positions(self) -> int:
+        return len(self._positions)
+
+    @property
+    def has_positions(self) -> bool:
+        return len(self._positions) > 0
+
     @property
     def cumulative_pnl(self) -> float:
-        """Get cumulative P&L from all closed trades."""
         return self._cumulative_pnl
-    
+
     @property
-    def trade_history(self) -> list[Trade]:
-        """Get history of all completed trades."""
-        return self._trade_history
-    
-    def _calculate_slippage(self, price: float, position_type: PositionType) -> float:
-        """
-        Calculate slippage for order execution.
-        
-        Slippage is always adverse to the position:
-        - LONG: entry price is higher than expected
-        - SHORT: entry price is lower than expected
-        """
-        import random
-        
-        if random.random() > self.slippage_prob:
+    def closed_trades(self) -> list[ClosedTrade]:
+        return list(self._closed_trades)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sample_slippage(self) -> float:
+        """Return an adverse slippage amount (0.0 if no slippage this fill)."""
+        if self._rng.random() > self.slippage_prob:
             return 0.0
-        
-        slippage = random.uniform(*self.slippage_range)
-        return slippage  # Applied adversarially in execute_order
-    
-    def _get_execution_price(
-        self,
-        market_price: float,
-        position_type: PositionType,
-    ) -> tuple[float, float, float]:
+        lo, hi = self.slippage_range
+        return float(self._rng.uniform(lo, hi))
+
+    def _fill_price_open(self, market_price: float, direction: Direction) -> tuple[float, float, float]:
         """
-        Get actual execution price including spread and slippage.
-        
-        Returns:
-            Tuple of (execution_price, spread_cost, slippage_cost)
+        Compute the actual fill price when opening a position.
+
+        LONG  → pay the ask  (market + half-spread + slippage)
+        SHORT → receive bid  (market - half-spread - slippage)
+
+        Returns (fill_price, half_spread, slippage).
         """
-        slippage = self._calculate_slippage(market_price, position_type)
-        
-        if position_type == PositionType.LONG:
-            # Buy at ask price (market_price + spread/2 + slippage)
-            execution_price = market_price + self.spread / 2 + slippage
-        else:  # SHORT
-            # Sell at bid price (market_price - spread/2 - slippage)
-            execution_price = market_price - self.spread / 2 - slippage
-        
-        spread_cost = self.spread / 2
-        return execution_price, spread_cost, slippage
-    
-    def _get_exit_price(
-        self,
-        market_price: float,
-        position_type: PositionType,
-    ) -> tuple[float, float, float]:
+        half_spread = self.spec.spread_price / 2.0
+        slip        = self._sample_slippage()
+
+        if direction == Direction.LONG:
+            fill = market_price + half_spread + slip
+        else:
+            fill = market_price - half_spread - slip
+
+        return fill, half_spread, slip
+
+    def _fill_price_close(self, market_price: float, direction: Direction) -> tuple[float, float, float]:
         """
-        Get exit execution price including spread and slippage.
-        
-        Returns:
-            Tuple of (execution_price, spread_cost, slippage_cost)
+        Compute the actual fill price when closing a position.
+
+        Closing a LONG  → sell at bid  (market - half-spread - slippage)
+        Closing a SHORT → buy  at ask  (market + half-spread + slippage)
+
+        Returns (fill_price, half_spread, slippage).
         """
-        slippage = self._calculate_slippage(market_price, position_type)
-        
-        if position_type == PositionType.LONG:
-            # Close long at bid price (market_price - spread/2 - slippage)
-            execution_price = market_price - self.spread / 2 - slippage
-        else:  # SHORT
-            # Close short at ask price (market_price + spread/2 + slippage)
-            execution_price = market_price + self.spread / 2 + slippage
-        
-        spread_cost = self.spread / 2
-        return execution_price, spread_cost, slippage
-    
+        half_spread = self.spec.spread_price / 2.0
+        slip        = self._sample_slippage()
+
+        if direction == Direction.LONG:
+            fill = market_price - half_spread - slip
+        else:
+            fill = market_price + half_spread + slip
+
+        return fill, half_spread, slip
+
+    # ------------------------------------------------------------------
+    # Core order operations
+    # ------------------------------------------------------------------
+
     def open_position(
         self,
         market_price: float,
-        position_type: PositionType,
-        size: float = 1.0,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        direction: Direction,
+        lot_size: float,
     ) -> Optional[Position]:
         """
-        Open a new trading position.
-        
-        Args:
-            market_price: Current market price
-            position_type: LONG or SHORT
-            size: Position size in lots
-            stop_loss: Optional stop-loss price level
-            take_profit: Optional take-profit price level
-            
-        Returns:
-            The opened Position, or None if a position is already open
+        Open a new position at market price.
+
+        Returns the new Position, or None if the position cap is already reached.
         """
-        if self._position is not None:
+        if self.n_positions >= self.max_positions:
+            logger.debug(
+                "Cannot open position: at max_positions cap (%d).", self.max_positions
+            )
             return None
-        
-        execution_price, spread_cost, slippage = self._get_execution_price(
-            market_price, position_type
+
+        fill, spread_paid, slippage = self._fill_price_open(market_price, direction)
+
+        pos = Position(
+            ticket      = self._next_ticket,
+            direction   = direction,
+            lot_size    = lot_size,
+            entry_price = fill,
+            open_price  = market_price,
+            spread_paid = spread_paid,
+            slippage    = slippage,
         )
-        
-        self._position = Position(
-            type=position_type,
-            entry_price=execution_price,
-            size=size,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            slippage=slippage,
-            spread=spread_cost,
+        self._positions.append(pos)
+        self._next_ticket += 1
+
+        logger.debug(
+            "Opened %s ticket=%d lot=%.2f entry=%.5f (spread=%.5f slip=%.5f)",
+            direction.name, pos.ticket, lot_size, fill, spread_paid, slippage,
         )
-        
-        return self._position
-    
+        return pos
+
     def close_position(
         self,
         market_price: float,
-        reason: str = "close",
-    ) -> Optional[Trade]:
+        lot_size: float,
+    ) -> Optional[ClosedTrade]:
         """
-        Close the current position at market price.
-        
-        Args:
-            market_price: Current market price
-            reason: Reason for closing ('close', 'stop_loss', 'take_profit', 'reverse')
-            
-        Returns:
-            Trade record, or None if no position is open
+        Close the oldest open position whose lot_size matches the requested tier.
+
+        This implements the agreed hybrid-action close semantics:
+            (CLOSE, lot_tier) → close the oldest position opened with that lot size.
+
+        Returns the ClosedTrade record, or None if no matching position exists.
         """
-        if self._position is None:
-            return None
-        
-        position = self._position
-        exit_price, spread_cost, slippage = self._get_exit_price(
-            market_price, position.type
-        )
-        
-        # Calculate P&L
-        if position.type == PositionType.LONG:
-            pnl = (exit_price - position.entry_price) * position.size * 100_000
-        else:  # SHORT
-            pnl = (position.entry_price - exit_price) * position.size * 100_000
-        
-        total_slippage = position.slippage + slippage
-        total_spread = position.spread + spread_cost
-        
-        trade = Trade(
-            position_type=position.type,
-            entry_price=position.entry_price,
-            exit_price=exit_price,
-            size=position.size,
-            pnl=pnl,
-            slippage=total_slippage,
-            spread=total_spread,
-            exit_reason=reason,
-        )
-        
-        self._trade_history.append(trade)
-        self._cumulative_pnl += pnl
-        self._position = None
-        
-        return trade
-    
-    def reverse_position(
-        self,
-        market_price: float,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-    ) -> tuple[Optional[Trade], Optional[Position]]:
-        """
-        Reverse the current position (close and open opposite position).
-        
-        Args:
-            market_price: Current market price
-            stop_loss: Optional stop-loss for new position
-            take_profit: Optional take-profit for new position
-            
-        Returns:
-            Tuple of (closed Trade record, new Position)
-        """
-        if self._position is None:
-            return None, None
-        
-        # Close current position
-        closed_trade = self.close_position(market_price, reason="reverse")
-        
-        # Open opposite position
-        new_type = (
-            PositionType.SHORT
-            if self._position is None or closed_trade is None
-            else (
-                PositionType.LONG
-                if closed_trade.position_type == PositionType.SHORT
-                else PositionType.SHORT
+        # Find the oldest matching position (positions are appended in order)
+        target: Optional[Position] = None
+        for pos in self._positions:
+            if abs(pos.lot_size - lot_size) < 1e-9:
+                target = pos
+                break
+
+        if target is None:
+            logger.debug(
+                "CLOSE %.2f lots: no matching open position found.", lot_size
             )
-        )
-        
-        # Need to re-check position state after close
-        new_position = self.open_position(
-            market_price=market_price,
-            position_type=new_type,
-            size=closed_trade.size if closed_trade else 1.0,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-        )
-        
-        return closed_trade, new_position
-    
-    def check_breaches(self, current_price: float) -> Optional[Trade]:
-        """
-        Check if stop-loss or take-profit has been breached and close if so.
-        
-        Args:
-            current_price: Current market price to check against
-            
-        Returns:
-            Trade record if a breach occurred and position was closed, None otherwise
-        """
-        if self._position is None:
             return None
-        
-        if self._position.check_stop_loss(current_price):
-            return self.close_position(current_price, reason="stop_loss")
-        
-        if self._position.check_take_profit(current_price):
-            return self.close_position(current_price, reason="take_profit")
-        
-        return None
-    
-    def get_state(self, current_price: float) -> dict:
+
+        fill, spread_paid, slippage = self._fill_price_close(market_price, target.direction)
+
+        # P&L: price difference × lots × contract size
+        price_diff = (
+            (fill - target.entry_price)
+            if target.direction == Direction.LONG
+            else (target.entry_price - fill)
+        )
+        pnl = price_diff * target.lot_size * self.spec.contract_size
+
+        trade = ClosedTrade(
+            ticket      = target.ticket,
+            direction   = target.direction,
+            lot_size    = target.lot_size,
+            entry_price = target.entry_price,
+            exit_price  = fill,
+            pnl         = pnl,
+            spread_paid = target.spread_paid + spread_paid,
+            slippage    = target.slippage    + slippage,
+        )
+
+        self._positions.remove(target)
+        self._closed_trades.append(trade)
+        self._cumulative_pnl += pnl
+
+        logger.debug(
+            "Closed ticket=%d lot=%.2f exit=%.5f pnl=%.2f",
+            trade.ticket, trade.lot_size, fill, pnl,
+        )
+        return trade
+
+    def close_all(self, market_price: float) -> list[ClosedTrade]:
+        """Close every open position. Used at episode end."""
+        trades = []
+        # Iterate over a copy since close_position mutates self._positions
+        for pos in list(self._positions):
+            trade = self.close_position(market_price, pos.lot_size)
+            if trade is not None:
+                trades.append(trade)
+        return trades
+
+    # ------------------------------------------------------------------
+    # State query
+    # ------------------------------------------------------------------
+
+    def total_unrealized_pnl(self, current_price: float) -> float:
+        """Sum of unrealized P&L across all open positions."""
+        return sum(
+            p.unrealized_pnl(current_price, self.spec.contract_size)
+            for p in self._positions
+        )
+
+    def position_state_vector(
+        self,
+        current_price: float,
+        max_positions: int,
+    ) -> np.ndarray:
         """
-        Get current simulator state for observation.
-        
-        Args:
-            current_price: Current market price
-            
-        Returns:
-            Dictionary with current state information
+        Return a fixed-length float32 vector representing all open positions.
+
+        Each position slot is encoded as:
+            [is_filled, direction, lot_size, entry_price_delta, unrealized_pnl_norm]
+
+        Unfilled slots are zero-padded.  Length = max_positions * 5.
         """
-        if self._position is None:
-            return {
-                "has_position": False,
-                "position_type": 0,
-                "unrealized_pnl": 0.0,
-                "entry_price": 0.0,
-                "stop_loss": 0.0,
-                "take_profit": 0.0,
-            }
-        
-        position = self._position
-        return {
-            "has_position": True,
-            "position_type": 1 if position.type == PositionType.LONG else -1,
-            "unrealized_pnl": position.unrealized_pnl(current_price),
-            "entry_price": position.entry_price,
-            "stop_loss": position.stop_loss or 0.0,
-            "take_profit": position.take_profit or 0.0,
-        }
-    
+        slot_size = 5
+        vec = np.zeros(max_positions * slot_size, dtype=np.float32)
+
+        for i, pos in enumerate(self._positions[:max_positions]):
+            base = i * slot_size
+            vec[base + 0] = 1.0                                              # is_filled
+            vec[base + 1] = float(pos.direction)                             # +1 or -1
+            vec[base + 2] = pos.lot_size                                     # raw lots
+            vec[base + 3] = (pos.entry_price - current_price) / current_price  # rel delta
+            vec[base + 4] = pos.unrealized_pnl(current_price, self.spec.contract_size)
+
+        return vec
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     def reset(self) -> None:
-        """Reset simulator state (clear position but keep trade history)."""
-        self._position = None
-    
-    def reset_full(self) -> None:
-        """Full reset (clear position and trade history)."""
-        self._position = None
-        self._trade_history = []
+        """Full reset — clears positions, trade history, and cumulative P&L."""
+        self._positions      = []
+        self._closed_trades  = []
         self._cumulative_pnl = 0.0
+        self._next_ticket    = 1
+        logger.debug("Simulator reset.")

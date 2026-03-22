@@ -22,7 +22,6 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
 .venv/
 
 # Trading environment (keep source, ignore __pycache__)
@@ -64,3 +63,5 @@ data/processed/
 
 # Evaluation results
 data/evaluation/
+*.onnx
+models/model.onnx.data

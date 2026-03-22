@@ -1,375 +1,260 @@
 """
-Preprocessor for forex trading data.
+Preprocessor for multi-symbol forex OHLCV data.
 
-Provides feature scaling, normalization, and transformation
-for OHLCV data before feeding to the RL environment.
+Design goals
+------------
+- Price normalization must be pair-agnostic so a model trained on EURUSD
+  generalises to USDJPY without seeing different raw price scales.
+- Log returns achieve this: they express price movement as a fraction,
+  independent of the absolute price level (1.08 vs 150).
+- Volume is z-scored per file because liquidity profiles differ across
+  symbols; normalising each file independently keeps volume features
+  comparable within a symbol while still being scale-free.
+- No technical indicators — the agent learns directly from price action.
 """
 
+import logging
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
-class PriceScaler:
+# Expected column order for all OHLCV files
+OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+
+# ---------------------------------------------------------------------------
+# Core transforms — stateless, applied per-array
+# ---------------------------------------------------------------------------
+
+def log_returns(prices: np.ndarray) -> np.ndarray:
     """
-    Scaler for price data using log returns or relative pricing.
-    
-    Converts absolute prices to relative/normalized values
-    to make the model robust across different price levels.
+    Convert a 1-D or 2-D price array to log returns.
+
+    log_return[t] = log(price[t] / price[t-1])
+
+    The first row is set to 0.0 (no predecessor).  The output is the same
+    shape as the input, which keeps array indexing simple in the environment.
+
+    This transform is completely stateless — no fitting required — and
+    produces values that are directly comparable across EURUSD, USDJPY,
+    GBPJPY, etc.
     """
-    
-    def __init__(self, method: str = "log_return"):
-        """
-        Initialize the scaler.
-        
-        Args:
-            method: Scaling method ('log_return', 'relative', 'zscore')
-        """
-        self.method = method
-        self.reference_price: Optional[float] = None
-        self.mean: Optional[np.ndarray] = None
-        self.std: Optional[np.ndarray] = None
-        self._fitted = False
-    
-    def fit(self, data: np.ndarray) -> "PriceScaler":
-        """
-        Fit the scaler to data.
-        
-        Args:
-            data: OHLCV data array of shape (n_samples, n_features)
-            
-        Returns:
-            Self for chaining
-        """
-        if self.method == "zscore":
-            # Calculate mean and std for price columns (OHLC)
-            self.mean = np.mean(data[:, :4], axis=0)
-            self.std = np.std(data[:, :4], axis=0) + 1e-8
-        else:
-            # Use first close price as reference
-            self.reference_price = float(data[0, 3])  # Close is column 3
-        
-        self._fitted = True
-        return self
-    
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        """
-        Transform data using fitted scaler.
-        
-        Args:
-            data: OHLCV data array
-            
-        Returns:
-            Transformed data
-        """
-        if not self._fitted:
-            raise ValueError("Scaler must be fitted before transform")
-        
-        data = np.asarray(data, dtype=np.float64)
-        result = data.copy()
-        
-        if self.method == "log_return":
-            # Convert prices to log returns relative to reference
-            for i in range(4):  # OHLC columns
-                result[:, i] = np.log(data[:, i] / self.reference_price)
-        
-        elif self.method == "relative":
-            # Convert prices to relative (ratio to reference)
-            for i in range(4):  # OHLC columns
-                result[:, i] = data[:, i] / self.reference_price - 1.0
-        
-        elif self.method == "zscore":
-            # Standardize price columns
-            result[:, :4] = (data[:, :4] - self.mean) / self.std
-        
-        return result.astype(np.float32)
-    
-    def fit_transform(self, data: np.ndarray) -> np.ndarray:
-        """Fit and transform in one step."""
-        self.fit(data)
-        return self.transform(data)
-    
-    def inverse_transform(self, data: np.ndarray) -> np.ndarray:
-        """
-        Inverse transform back to original price scale.
-        
-        Args:
-            data: Transformed data
-            
-        Returns:
-            Data in original price scale
-        """
-        if not self._fitted:
-            raise ValueError("Scaler must be fitted before inverse_transform")
-        
-        data = np.asarray(data, dtype=np.float64)
-        result = data.copy()
-        
-        if self.method == "log_return":
-            for i in range(4):
-                result[:, i] = self.reference_price * np.exp(data[:, i])
-        
-        elif self.method == "relative":
-            for i in range(4):
-                result[:, i] = self.reference_price * (data[:, i] + 1.0)
-        
-        elif self.method == "zscore":
-            result[:, :4] = data[:, :4] * self.std + self.mean
-        
+    prices = np.asarray(prices, dtype=np.float64)
+
+    if prices.ndim == 1:
+        result        = np.empty_like(prices)
+        result[0]     = 0.0
+        result[1:]    = np.log(prices[1:] / prices[:-1])
         return result.astype(np.float32)
 
+    # 2-D: apply column-wise
+    result       = np.empty_like(prices)
+    result[0, :] = 0.0
+    result[1:, :] = np.log(prices[1:, :] / prices[:-1, :])
+    return result.astype(np.float32)
 
-class VolumeScaler:
+
+def zscore_volume(volume: np.ndarray) -> np.ndarray:
     """
-    Scaler for volume data using log or min-max scaling.
+    Z-score normalise a volume series in-place (fit on the full array).
+
+    Uses the population std.  A small epsilon prevents division by zero on
+    flat/synthetic data.
     """
-    
-    def __init__(self, method: str = "log"):
-        """
-        Initialize the volume scaler.
-        
-        Args:
-            method: Scaling method ('log', 'minmax', 'zscore')
-        """
-        self.method = method
-        self.min_vol: Optional[float] = None
-        self.max_vol: Optional[float] = None
-        self.mean_vol: Optional[float] = None
-        self.std_vol: Optional[float] = None
-        self._fitted = False
-    
-    def fit(self, volume: np.ndarray) -> "VolumeScaler":
-        """Fit the scaler to volume data."""
-        volume = np.asarray(volume).flatten()
-        
-        if self.method == "log":
-            pass  # No fitting needed for log transform
-        
-        elif self.method == "minmax":
-            self.min_vol = float(np.min(volume))
-            self.max_vol = float(np.max(volume))
-        
-        elif self.method == "zscore":
-            self.mean_vol = float(np.mean(volume))
-            self.std_vol = float(np.std(volume)) + 1e-8
-        
-        self._fitted = True
-        return self
-    
-    def transform(self, volume: np.ndarray) -> np.ndarray:
-        """Transform volume data."""
-        if not self._fitted:
-            raise ValueError("Scaler must be fitted before transform")
-        
-        volume = np.asarray(volume).flatten()
-        
-        if self.method == "log":
-            # Log transform with small epsilon to handle zero volume
-            result = np.log1p(volume)
-        
-        elif self.method == "minmax":
-            range_vol = self.max_vol - self.min_vol + 1e-8
-            result = (volume - self.min_vol) / range_vol
-        
-        elif self.method == "zscore":
-            result = (volume - self.mean_vol) / self.std_vol
-        
-        return result.astype(np.float32)
-    
-    def fit_transform(self, volume: np.ndarray) -> np.ndarray:
-        """Fit and transform in one step."""
-        self.fit(volume)
-        return self.transform(volume)
+    volume = np.asarray(volume, dtype=np.float64).flatten()
+    mean   = volume.mean()
+    std    = volume.std() + 1e-8
+    return ((volume - mean) / std).astype(np.float32)
 
 
-class FeatureProcessor:
-    """
-    Complete feature processing pipeline for OHLCV data.
-    
-    Combines price scaling, volume scaling, and optional
-    technical indicator calculation.
-    """
-    
-    def __init__(
-        self,
-        price_method: str = "log_return",
-        volume_method: str = "log",
-        add_technical_indicators: bool = False,
-    ):
-        """
-        Initialize the feature processor.
-        
-        Args:
-            price_method: Price scaling method
-            volume_method: Volume scaling method
-            add_technical_indicators: Whether to add technical indicators
-        """
-        self.price_method = price_method
-        self.volume_method = volume_method
-        self.add_technical_indicators = add_technical_indicators
-        
-        self.price_scaler = PriceScaler(method=price_method)
-        self.volume_scaler = VolumeScaler(method=volume_method)
-        self._fitted = False
-    
-    def fit(self, data: np.ndarray) -> "FeatureProcessor":
-        """
-        Fit the processor to data.
-        
-        Args:
-            data: OHLCV data array of shape (n_samples, 5) or (n_samples, 6)
-                  Columns: [open, high, low, close, volume, (spread)]
-        """
-        data = np.asarray(data)
-        
-        # Fit price scaler on OHLC columns
-        self.price_scaler.fit(data[:, :4])
-        
-        # Fit volume scaler on volume column
-        self.volume_scaler.fit(data[:, 4])
-        
-        self._fitted = True
-        return self
-    
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        """
-        Transform data using fitted processors.
-        
-        Args:
-            data: OHLCV data array
-            
-        Returns:
-            Transformed data with same shape
-        """
-        if not self._fitted:
-            raise ValueError("Processor must be fitted before transform")
-        
-        data = np.asarray(data, dtype=np.float64)
-        n_samples = data.shape[0]
-        
-        # Transform prices (OHLC)
-        prices = self.price_scaler.transform(data[:, :4])
+# ---------------------------------------------------------------------------
+# High-level pipeline
+# ---------------------------------------------------------------------------
 
-        # Transform volume (flatten for scaler, then reshape)
-        volume = self.volume_scaler.transform(data[:, 4]).reshape(-1, 1)
-
-        # Handle optional spread column
-        if data.shape[1] >= 6:
-            spread = data[:, 5:6].astype(np.float32)
-            result = np.hstack([prices, volume, spread])
-        else:
-            result = np.hstack([prices, volume])
-        
-        # Add technical indicators if requested
-        if self.add_technical_indicators:
-            indicators = self._calculate_technical_indicators(data)
-            result = np.hstack([result, indicators])
-        
-        return result
-    
-    def fit_transform(self, data: np.ndarray) -> np.ndarray:
-        """Fit and transform in one step."""
-        self.fit(data)
-        return self.transform(data)
-    
-    def _calculate_technical_indicators(self, data: np.ndarray) -> np.ndarray:
-        """
-        Calculate technical indicators from raw OHLCV data.
-        
-        Args:
-            data: Raw OHLCV data
-            
-        Returns:
-            Array of technical indicators
-        """
-        indicators = []
-        
-        # Price range (high - low)
-        price_range = (data[:, 1] - data[:, 2]) / data[:, 3]
-        indicators.append(price_range)
-        
-        # Price momentum (close - open) / open
-        momentum = (data[:, 3] - data[:, 0]) / data[:, 0]
-        indicators.append(momentum)
-        
-        # Upper shadow (high - max(open, close))
-        upper_shadow = data[:, 1] - np.maximum(data[:, 0], data[:, 3])
-        upper_shadow = upper_shadow / data[:, 3]
-        indicators.append(upper_shadow)
-        
-        # Lower shadow (min(open, close) - low)
-        lower_shadow = np.minimum(data[:, 0], data[:, 3]) - data[:, 2]
-        lower_shadow = lower_shadow / data[:, 3]
-        indicators.append(lower_shadow)
-        
-        return np.column_stack(indicators).astype(np.float32)
-    
-    def get_feature_names(self, original_names: Optional[list[str]] = None) -> list[str]:
-        """
-        Get names for transformed features.
-        
-        Args:
-            original_names: Original feature names
-            
-        Returns:
-            List of transformed feature names
-        """
-        if original_names is None:
-            original_names = ["open", "high", "low", "close", "volume"]
-        
-        names = []
-        
-        # Transformed price features
-        for name in original_names[:4]:
-            names.append(f"{name}_{self.price_method}")
-        
-        # Transformed volume
-        names.append(f"volume_{self.volume_method}")
-        
-        # Spread if present
-        if len(original_names) > 5:
-            names.append(original_names[5])
-        
-        # Technical indicators
-        if self.add_technical_indicators:
-            names.extend(["price_range", "momentum", "upper_shadow", "lower_shadow"])
-        
-        return names
-
-
-def create_ohlcv_dataframe(
+def preprocess(
     data: np.ndarray,
     columns: Optional[list[str]] = None,
-    index: Optional[pd.DatetimeIndex] = None,
-) -> pd.DataFrame:
+) -> np.ndarray:
     """
-    Create a pandas DataFrame from OHLCV numpy array.
-    
+    Full preprocessing pipeline for a single OHLCV array.
+
+    Steps
+    -----
+    1. Validate shape — must have at least 5 columns (OHLCV).
+    2. Apply log returns to OHLC columns (columns 0–3).
+    3. Z-score normalise volume (column 4).
+    4. Pass through any extra columns (e.g. spread) unchanged.
+
     Args:
-        data: OHLCV data array
-        columns: Column names (default: ['open', 'high', 'low', 'close', 'volume'])
-        index: Datetime index for the DataFrame
-        
+        data:    Raw OHLCV array of shape (n_samples, ≥5).
+        columns: Column names for logging only (default: OHLCV_COLUMNS).
+
     Returns:
-        pandas DataFrame with OHLCV data
+        Preprocessed float32 array of the same shape.
     """
     if columns is None:
-        columns = ["open", "high", "low", "close", "volume"]
-    
-    return pd.DataFrame(data, columns=columns, index=index)
+        columns = OHLCV_COLUMNS
+
+    data = np.asarray(data, dtype=np.float64)
+
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2-D array, got shape {data.shape}")
+    if data.shape[1] < 5:
+        raise ValueError(
+            f"Expected at least 5 columns (OHLCV), got {data.shape[1]}"
+        )
+
+    n_samples, n_cols = data.shape
+    result            = np.empty_like(data, dtype=np.float32)
+
+    # OHLC → log returns
+    result[:, :4] = log_returns(data[:, :4])
+
+    # Volume → z-score
+    result[:, 4] = zscore_volume(data[:, 4])
+
+    # Pass through any extra columns (e.g. broker spread column)
+    if n_cols > 5:
+        result[:, 5:] = data[:, 5:].astype(np.float32)
+
+    logger.debug(
+        "Preprocessed %d samples, %d features. "
+        "OHLC → log returns; volume → z-score.",
+        n_samples, n_cols,
+    )
+    return result
 
 
-def normalize_ohlcv(data: np.ndarray, method: str = "log_return") -> np.ndarray:
+# ---------------------------------------------------------------------------
+# File I/O helpers
+# ---------------------------------------------------------------------------
+
+def load_csv(
+    path: str | Path,
+    columns: Optional[list[str]] = None,
+    datetime_col: Optional[str] = "time",
+) -> tuple[np.ndarray, Optional[pd.DatetimeIndex]]:
     """
-    Convenience function to normalize OHLCV data.
-    
+    Load a CSV file and return a raw OHLCV numpy array plus optional index.
+
+    The CSV is expected to have columns matching `columns` (case-insensitive).
+    Extra columns are dropped.  The datetime column, if present, becomes the
+    returned index.
+
     Args:
-        data: OHLCV data array
-        method: Normalization method
-        
+        path:         Path to CSV file.
+        columns:      Expected OHLCV column names.
+        datetime_col: Name of datetime column to parse as index (or None).
+
     Returns:
-        Normalized data
+        (data_array, datetime_index_or_None)
     """
-    processor = FeatureProcessor(price_method=method, volume_method="log")
-    return processor.fit_transform(data)
+    if columns is None:
+        columns = OHLCV_COLUMNS
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.lower().str.strip()
+
+    # Parse datetime index if available
+    dt_index: Optional[pd.DatetimeIndex] = None
+    if datetime_col and datetime_col.lower() in df.columns:
+        dt_index = pd.to_datetime(df[datetime_col.lower()])
+        df = df.drop(columns=[datetime_col.lower()])
+
+    # Select and order required columns
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {path.name}: {missing}")
+
+    data = df[columns].to_numpy(dtype=np.float64)
+
+    logger.info("Loaded %d rows from %s", len(data), path.name)
+    return data, dt_index
+
+
+def load_npy(path: str | Path) -> np.ndarray:
+    """Load a pre-saved .npy OHLCV array."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+    data = np.load(path)
+    logger.info("Loaded %s from %s", data.shape, path.name)
+    return data
+
+
+def load_and_preprocess(
+    path: str | Path,
+    columns: Optional[list[str]] = None,
+) -> np.ndarray:
+    """
+    Convenience: load a CSV or .npy file and immediately preprocess it.
+
+    This is the main entry point used by the training pipeline when
+    iterating over data/raw/*.csv.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".npy":
+        raw = load_npy(path)
+    else:
+        raw, _ = load_csv(path, columns=columns)
+
+    return preprocess(raw, columns=columns)
+
+
+def load_symbol_files(
+    data_dir: str | Path,
+    symbols: Optional[list[str]] = None,
+    columns: Optional[list[str]] = None,
+) -> dict[str, np.ndarray]:
+    """
+    Load and preprocess all symbol files in a directory.
+
+    Each file is normalised independently (per-file volume z-score).
+    Price log returns are stateless so no cross-symbol state is needed.
+
+    Args:
+        data_dir: Directory containing SYMBOL.csv or SYMBOL.npy files.
+        symbols:  Whitelist of symbol names (without extension).
+                  If None, all .csv and .npy files are loaded.
+        columns:  OHLCV column names.
+
+    Returns:
+        Dict mapping symbol name → preprocessed float32 array.
+    """
+    data_dir = Path(data_dir)
+    results: dict[str, np.ndarray] = {}
+
+    patterns = ["*.csv", "*.npy"]
+    files: list[Path] = []
+    for pat in patterns:
+        files.extend(sorted(data_dir.glob(pat)))
+
+    if not files:
+        raise FileNotFoundError(f"No data files found in {data_dir}")
+
+    for fpath in files:
+        symbol = fpath.stem.upper()
+        if symbols is not None and symbol not in [s.upper() for s in symbols]:
+            continue
+
+        try:
+            results[symbol] = load_and_preprocess(fpath, columns=columns)
+            logger.info("Preprocessed %s → shape %s", symbol, results[symbol].shape)
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", fpath.name, exc)
+
+    if not results:
+        raise ValueError(
+            f"No symbol files could be loaded from {data_dir} "
+            f"(requested: {symbols})"
+        )
+
+    return results
