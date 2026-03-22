@@ -58,7 +58,7 @@ class PPOAgent(BaseAgent):
 
     def load(self, path: str) -> None:
         log.info("Loading PPO model from %s", path)
-        self.model = PPO.load(path)
+        self.model = PPO.load(path, device="cpu")
         self.name  = f"ppo:{path}"
 
     def save(self, path: str) -> None:

@@ -53,8 +53,14 @@ reward:
   drawdown_penalty_scale: 1.0
 
   # Scales how much the agent is penalised for leaving profit on the
-  # table vs the best price reached (MFE). 0.5 = half weight.
+  # table vs the best price reached (MFE). Uses capture ratio so only
+  # fires when MFE was positive. 0.5 = half weight.
   missed_profit_scale: 0.5
+
+  # Scales the per-step shaping reward based on unrealized PnL delta.
+  # Encourages closing deteriorating positions without dominating the
+  # sparse close reward. Keep small (0.05–0.2).
+  step_reward_scale: 0.1
 
 
 
@@ -107,7 +113,7 @@ agent:
   clip_range: 0.2
   
   # Entropy coefficient
-  ent_coef: 0.01
+  ent_coef: 0.05
   
   # Value function coefficient
   vf_coef: 0.5

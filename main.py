@@ -13,8 +13,11 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 # ---------------------------------------------------------------------------

@@ -64,16 +64,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Action index constants (mirrors simulator.Action)
 # ---------------------------------------------------------------------------
-_A_HOLD  = 0
-_A_BUY   = 1
-_A_SELL  = 2
-_A_CLOSE = 3
+_A_HOLD      = 0
+_A_BUY       = 1
+_A_SELL      = 2
+_A_CLOSE_L   = 3  # CLOSE_LONG
+_A_CLOSE_S   = 4  # CLOSE_SHORT
 
 _ACTION_LABELS = {
-    _A_HOLD:  "HOLD",
-    _A_BUY:   "BUY",
-    _A_SELL:  "SELL",
-    _A_CLOSE: "CLOSE",
+    _A_HOLD:    "HOLD",
+    _A_BUY:     "BUY",
+    _A_SELL:    "SELL",
+    _A_CLOSE_L: "CLOSE_L",
+    _A_CLOSE_S: "CLOSE_S",
 }
 
 # ---------------------------------------------------------------------------
@@ -93,10 +95,11 @@ _WHITE  = "#e8eaf0"
 
 # Colour per action index — used for the strip and its legend
 _ACTION_COLOURS = {
-    _A_HOLD:  _MUTED,
-    _A_BUY:   _GREEN,
-    _A_SELL:  _RED,
-    _A_CLOSE: _AMBER,
+    _A_HOLD:    _MUTED,
+    _A_BUY:     _GREEN,
+    _A_SELL:    _RED,
+    _A_CLOSE_L: _AMBER,
+    _A_CLOSE_S: _PURPLE,
 }
 
 
@@ -435,10 +438,11 @@ class EpisodeVisualiser:
             # Inline legend — coloured squares + labels at the right edge
             legend_x  = vis_steps[-1] + 0.5 + (vis_steps[-1] - vis_steps[0]) * 0.01
             items = [
-                (_ACTION_COLOURS[_A_HOLD],  "HOLD"),
-                (_ACTION_COLOURS[_A_BUY],   "BUY"),
-                (_ACTION_COLOURS[_A_SELL],  "SELL"),
-                (_ACTION_COLOURS[_A_CLOSE], "CLOSE"),
+                (_ACTION_COLOURS[_A_HOLD],    "HOLD"),
+                (_ACTION_COLOURS[_A_BUY],     "BUY"),
+                (_ACTION_COLOURS[_A_SELL],    "SELL"),
+                (_ACTION_COLOURS[_A_CLOSE_L], "CLOSE_L"),
+                (_ACTION_COLOURS[_A_CLOSE_S], "CLOSE_S"),
             ]
             patches = [
                 self._mpatches.Patch(color=c, label=lbl)
@@ -447,7 +451,7 @@ class EpisodeVisualiser:
             ax_action.legend(
                 handles   = patches,
                 loc       = "center right",
-                ncol      = 4,
+                ncol      = 5,
                 facecolor = _BG,
                 edgecolor = _GRID,
                 labelcolor= _TEXT,

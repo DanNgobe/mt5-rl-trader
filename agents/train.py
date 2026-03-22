@@ -55,6 +55,7 @@ def _make_env_fn(
             invalid_action_penalty = reward_cfg.get("invalid_action_penalty", -0.01),
             drawdown_penalty_scale = reward_cfg.get("drawdown_penalty_scale", 1.0),
             missed_profit_scale    = reward_cfg.get("missed_profit_scale", 0.5),
+            step_reward_scale      = reward_cfg.get("step_reward_scale", 0.1),
             render_mode            = None,
         )
         env.reset(seed=seed)
