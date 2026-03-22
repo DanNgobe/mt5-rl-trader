@@ -7,7 +7,7 @@ Spread and slippage are applied per-symbol via SymbolSpec.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
 
@@ -36,7 +36,7 @@ class SymbolSpec:
     """Per-symbol trading specification."""
     name:          str
     pip_value:     float   # 0.0001 for EURUSD, 0.01 for USDJPY
-    pip_location:  int     # decimal places for a pip
+    pip_location:  int
     contract_size: int     # units per lot, typically 100_000
     spread_pips:   float
     min_lot:       float
@@ -58,6 +58,14 @@ class Position:
     open_price:  float  # raw market price at open (reference only)
     spread_paid: float = 0.0
     slippage:    float = 0.0
+    # Maximum favourable / adverse excursion prices (updated each step)
+    mfe_price:   float = 0.0  # best price reached in trade's favour
+    mae_price:   float = 0.0  # worst price reached against the trade
+
+    def __post_init__(self):
+        # Initialise excursion prices to entry so first update is correct
+        self.mfe_price = self.entry_price
+        self.mae_price = self.entry_price
 
     def unrealized_pnl(self, current_price: float, contract_size: int) -> float:
         price_diff = (
@@ -67,10 +75,19 @@ class Position:
         )
         return price_diff * self.lot_size * contract_size
 
+    def update_excursions(self, current_price: float) -> None:
+        """Track the best and worst price seen during this trade's lifetime."""
+        if self.direction == Direction.LONG:
+            self.mfe_price = max(self.mfe_price, current_price)
+            self.mae_price = min(self.mae_price, current_price)
+        else:
+            self.mfe_price = min(self.mfe_price, current_price)
+            self.mae_price = max(self.mae_price, current_price)
+
 
 @dataclass
 class ClosedTrade:
-    """Record of a completed trade."""
+    """Record of a completed trade, including excursion data."""
     ticket:      int
     direction:   Direction
     lot_size:    float
@@ -79,6 +96,8 @@ class ClosedTrade:
     pnl:         float
     spread_paid: float
     slippage:    float
+    mfe_pnl:     float  # P&L at the most favourable price reached
+    mae_pnl:     float  # P&L at the most adverse price reached
 
     def to_dict(self) -> dict:
         return {
@@ -90,7 +109,27 @@ class ClosedTrade:
             "pnl":         self.pnl,
             "spread_paid": self.spread_paid,
             "slippage":    self.slippage,
+            "mfe_pnl":     self.mfe_pnl,
+            "mae_pnl":     self.mae_pnl,
         }
+
+
+@dataclass
+class OrderResult:
+    """
+    Result of an open or close attempt.
+
+    success  — the order was executed
+    invalid  — the action was illegal (triggers a penalty in the env)
+    reason   — human-readable explanation when invalid or failed
+    position — set on successful open
+    trade    — set on successful close
+    """
+    success:  bool
+    invalid:  bool               = False
+    reason:   str                = ""
+    position: Optional[Position]    = None
+    trade:    Optional[ClosedTrade] = None
 
 
 class TradeSimulator:
@@ -141,6 +180,11 @@ class TradeSimulator:
     def closed_trades(self) -> list[ClosedTrade]:
         return list(self._closed_trades)
 
+    def update_excursions(self, current_price: float) -> None:
+        """Update MFE/MAE on every open position. Call once per env step."""
+        for pos in self._positions:
+            pos.update_excursions(current_price)
+
     def _sample_slippage(self) -> float:
         if self._rng.random() > self.slippage_prob:
             return 0.0
@@ -148,7 +192,6 @@ class TradeSimulator:
         return float(self._rng.uniform(lo, hi))
 
     def _fill_open(self, market_price: float, direction: Direction) -> tuple[float, float, float]:
-        """Returns (fill_price, half_spread, slippage). Adverse fill."""
         half_spread = self.spec.spread_price / 2.0
         slip        = self._sample_slippage()
         fill = (market_price + half_spread + slip) if direction == Direction.LONG \
@@ -156,23 +199,25 @@ class TradeSimulator:
         return fill, half_spread, slip
 
     def _fill_close(self, market_price: float, direction: Direction) -> tuple[float, float, float]:
-        """Returns (fill_price, half_spread, slippage). Adverse fill."""
         half_spread = self.spec.spread_price / 2.0
         slip        = self._sample_slippage()
         fill = (market_price - half_spread - slip) if direction == Direction.LONG \
                else (market_price + half_spread + slip)
         return fill, half_spread, slip
 
-    def open_position(
-        self,
-        market_price: float,
-        direction:    Direction,
-        lot_size:     float,
-    ) -> Optional[Position]:
-        """Open a new position. Returns None if at max_positions cap."""
+    def _pnl(self, entry: float, exit_: float, direction: Direction, lot_size: float) -> float:
+        price_diff = (exit_ - entry) if direction == Direction.LONG else (entry - exit_)
+        return price_diff * lot_size * self.spec.contract_size
+
+    def open_position(self, market_price: float, direction: Direction, lot_size: float) -> OrderResult:
+        """
+        Open a new position at market price.
+
+        Returns OrderResult(invalid=True) if at max_positions cap.
+        """
         if self.n_positions >= self.max_positions:
             logger.debug("Cannot open: at max_positions cap (%d).", self.max_positions)
-            return None
+            return OrderResult(success=False, invalid=True, reason="max_positions_reached")
 
         fill, spread_paid, slippage = self._fill_open(market_price, direction)
         pos = Position(
@@ -187,22 +232,24 @@ class TradeSimulator:
         self._positions.append(pos)
         self._next_ticket += 1
         logger.debug("Opened %s ticket=%d lot=%.2f entry=%.5f", direction.name, pos.ticket, lot_size, fill)
-        return pos
+        return OrderResult(success=True, position=pos)
 
-    def close_position(self, market_price: float, lot_size: float) -> Optional[ClosedTrade]:
+    def close_position(self, market_price: float, lot_size: float) -> OrderResult:
         """
         Close the oldest open position matching lot_size.
-        Returns the ClosedTrade, or None if no match found.
+
+        Returns OrderResult(invalid=True) if no matching position exists.
         """
         target = next((p for p in self._positions if abs(p.lot_size - lot_size) < 1e-9), None)
         if target is None:
             logger.debug("CLOSE %.2f lots: no matching position.", lot_size)
-            return None
+            return OrderResult(success=False, invalid=True, reason="no_matching_lot")
 
         fill, spread_paid, slippage = self._fill_close(market_price, target.direction)
-        price_diff = (fill - target.entry_price) if target.direction == Direction.LONG \
-                     else (target.entry_price - fill)
-        pnl = price_diff * target.lot_size * self.spec.contract_size
+
+        mfe_pnl = self._pnl(target.entry_price, target.mfe_price, target.direction, target.lot_size)
+        mae_pnl = self._pnl(target.entry_price, target.mae_price, target.direction, target.lot_size)
+        pnl     = self._pnl(target.entry_price, fill,             target.direction, target.lot_size)
 
         trade = ClosedTrade(
             ticket      = target.ticket,
@@ -213,17 +260,23 @@ class TradeSimulator:
             pnl         = pnl,
             spread_paid = target.spread_paid + spread_paid,
             slippage    = target.slippage    + slippage,
+            mfe_pnl     = mfe_pnl,
+            mae_pnl     = mae_pnl,
         )
         self._positions.remove(target)
         self._closed_trades.append(trade)
         self._cumulative_pnl += pnl
         logger.debug("Closed ticket=%d lot=%.2f exit=%.5f pnl=%.2f", trade.ticket, trade.lot_size, fill, pnl)
-        return trade
+        return OrderResult(success=True, trade=trade)
 
     def close_all(self, market_price: float) -> list[ClosedTrade]:
         """Close every open position. Used at episode end."""
-        return [t for pos in list(self._positions)
-                if (t := self.close_position(market_price, pos.lot_size)) is not None]
+        trades = []
+        for pos in list(self._positions):
+            result = self.close_position(market_price, pos.lot_size)
+            if result.trade is not None:
+                trades.append(result.trade)
+        return trades
 
     def total_unrealized_pnl(self, current_price: float) -> float:
         return sum(p.unrealized_pnl(current_price, self.spec.contract_size) for p in self._positions)

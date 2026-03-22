@@ -39,19 +39,23 @@ def _make_env_fn(
     raw_close:   np.ndarray,
     symbol_spec,
     env_config:  dict,
+    reward_cfg:  dict,
     seed:        int,
 ):
     def _init():
         env = TradingEnv(
-            data            = data,
-            raw_close       = raw_close,
-            symbol_spec     = symbol_spec,
-            window_size     = env_config["window_size"],
-            initial_balance = env_config["initial_balance"],
-            max_positions   = env_config.get("max_positions", 3),
-            slippage_prob   = env_config["slippage_prob"],
-            slippage_range  = tuple(env_config["slippage_range"]),
-            render_mode     = None,
+            data                   = data,
+            raw_close              = raw_close,
+            symbol_spec            = symbol_spec,
+            window_size            = env_config["window_size"],
+            initial_balance        = env_config["initial_balance"],
+            max_positions          = env_config.get("max_positions", 3),
+            slippage_prob          = env_config["slippage_prob"],
+            slippage_range         = tuple(env_config["slippage_range"]),
+            invalid_action_penalty = reward_cfg.get("invalid_action_penalty", -0.01),
+            drawdown_penalty_scale = reward_cfg.get("drawdown_penalty_scale", 1.0),
+            missed_profit_scale    = reward_cfg.get("missed_profit_scale", 0.5),
+            render_mode            = None,
         )
         env.reset(seed=seed)
         return env
@@ -173,6 +177,7 @@ def train(
     env_cfg     = config["environment"]
     train_cfg   = config["training"]
     agent_cfg   = config["agent"]
+    reward_cfg  = config.get("reward", {})
     symbols_cfg = config.get("symbols_config", "config/symbols.yaml")
 
     if data_dir is None:
@@ -201,8 +206,8 @@ def train(
             raw_close = np.load(raw_path)[:, 3]
 
         spec = load_symbol_spec(symbols_cfg, symbol)
-        env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, seed + i))
-        eval_env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, seed + 10_000 + i))
+        env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, reward_cfg, seed + i))
+        eval_env_fns.append(_make_env_fn(processed, raw_close, spec, env_cfg, reward_cfg, seed + 10_000 + i))
 
     VecEnvCls = DummyVecEnv if len(env_fns) == 1 else SubprocVecEnv
     vec_env   = VecEnvCls(env_fns)

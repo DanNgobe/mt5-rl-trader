@@ -13,6 +13,9 @@ environment:
   slippage_prob: 0.3      # 30% chance of slippage
   slippage_range: [0.00001, 0.0005]  # 0.1 to 5 pips
   
+  # Hard cap on simultaneous open positions
+  max_positions: 3
+
   # Episode termination
   max_drawdown_pct: 0.5   # 50% drawdown triggers margin call
 
@@ -38,7 +41,23 @@ data:
   bars_per_year: 6048
 
 
-# Preprocessing Configuration
+# Reward Configuration
+# =====================
+reward:
+  # Flat penalty applied when the agent attempts an illegal action
+  # (opening at max_positions, closing a lot tier with no open position)
+  invalid_action_penalty: -0.01
+
+  # Scales how much the agent is penalised for the worst drawdown
+  # during a trade (MAE). 1.0 = full weight, 0.0 = ignore.
+  drawdown_penalty_scale: 1.0
+
+  # Scales how much the agent is penalised for leaving profit on the
+  # table vs the best price reached (MFE). 0.5 = half weight.
+  missed_profit_scale: 0.5
+
+
+
 # ===========================
 preprocessing:
   # Price normalization method: log_return, relative, zscore

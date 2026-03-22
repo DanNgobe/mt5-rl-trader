@@ -41,6 +41,7 @@ class Evaluator:
         self.config      = load_config(config_path)
         self.env_cfg     = self.config["environment"]
         self.symbols_cfg = self.config.get("symbols_config", "config/symbols.yaml")
+        self._reward_cfg = self.config.get("reward", {})
         self.bars_per_year = int(
             self.config.get("data", {}).get("bars_per_year", 6048)
         )
@@ -94,15 +95,18 @@ class Evaluator:
         # ------------------------------------------------------------------
         def _make_env():
             return TradingEnv(
-                data            = processed,
-                raw_close       = raw_close,
-                symbol_spec     = symbol_spec,
-                window_size     = self.env_cfg["window_size"],
-                initial_balance = initial_balance,
-                max_positions   = self.env_cfg.get("max_positions", 3),
-                slippage_prob   = self.env_cfg["slippage_prob"],
-                slippage_range  = tuple(self.env_cfg["slippage_range"]),
-                render_mode     = None,
+                data                   = processed,
+                raw_close              = raw_close,
+                symbol_spec            = symbol_spec,
+                window_size            = self.env_cfg["window_size"],
+                initial_balance        = initial_balance,
+                max_positions          = self.env_cfg.get("max_positions", 3),
+                slippage_prob          = self.env_cfg["slippage_prob"],
+                slippage_range         = tuple(self.env_cfg["slippage_range"]),
+                invalid_action_penalty = self._reward_cfg.get("invalid_action_penalty", -0.01),
+                drawdown_penalty_scale = self._reward_cfg.get("drawdown_penalty_scale", 1.0),
+                missed_profit_scale    = self._reward_cfg.get("missed_profit_scale", 0.5),
+                render_mode            = None,
             )
 
         vec_env   = DummyVecEnv([_make_env])
