@@ -109,6 +109,7 @@ class Evaluator:
                 holding_cost_per_lot   = self._reward_cfg.get("holding_cost_per_lot", 0.0001),
                 flat_penalty_per_step  = self._reward_cfg.get("flat_penalty_per_step", 0.0),
                 spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
+                wrong_lot_penalty      = self._reward_cfg.get("wrong_lot_penalty", 0.0002),
                 render_mode            = None,
             )
 
@@ -153,11 +154,10 @@ class Evaluator:
 
                 price  = inner_env._current_price()
                 equity = inner_env._balance + inner_env._sim.total_unrealized_pnl(price)
-                step_reward = (equity - prev_equity) / initial_balance
                 prev_equity = equity
 
                 if vis is not None:
-                    vis.update(inner_env, step_reward, action=action)
+                    vis.update(inner_env, float(rewards[0]), action=action)
 
                 equity_curve.append(equity)
 

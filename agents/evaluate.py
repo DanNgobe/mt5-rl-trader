@@ -30,13 +30,10 @@ def evaluate(
 
     if export_onnx_:
         from agents.train import export_onnx
-        from env.preprocessor import load_csv, load_npy, preprocess
-        path    = Path(data_path)
-        raw     = load_npy(path) if path.suffix.lower() == ".npy" else load_csv(path)[0]
-        obs_dim = (
-            evaluator.env_cfg["window_size"] * preprocess(raw).shape[1]
-            + evaluator.env_cfg.get("max_positions", 3) * 5
-            + 2
+        from env.preprocessor import obs_dim_from_config
+        obs_dim = obs_dim_from_config(
+            evaluator.obs_cfg,
+            evaluator.env_cfg.get("max_positions", 3),
         )
         export_onnx(agent.model, onnx_path, obs_dim)
 

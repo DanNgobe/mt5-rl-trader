@@ -71,6 +71,9 @@ class TradingEnv(gym.Env):
         holding_cost_per_lot:    float = 0.0001,
         flat_penalty_per_step:   float = 0.0,
         spread_cost_scale:       float = 2.0,
+        wrong_lot_penalty:       float = 0.0002,
+        episode_length:          Optional[int] = None,
+        random_start:            bool  = False,
         render_mode:             Optional[str] = None,
     ):
         super().__init__()
@@ -92,6 +95,9 @@ class TradingEnv(gym.Env):
         self.holding_cost_per_lot   = holding_cost_per_lot
         self.flat_penalty_per_step  = flat_penalty_per_step
         self.spread_cost_scale      = spread_cost_scale
+        self.wrong_lot_penalty      = wrong_lot_penalty
+        self.episode_length         = episode_length
+        self.random_start           = random_start
 
         # Sparse lag indices (bars back from current step)
         self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
@@ -114,6 +120,8 @@ class TradingEnv(gym.Env):
         self._step:           int               = 0
         self._balance:        float             = initial_balance
         self._episode_trades: list[ClosedTrade] = []
+        self._start_step:     int               = self._min_step
+        self._end_step:       int               = n
 
     # ------------------------------------------------------------------
     # Gym interface
@@ -123,9 +131,25 @@ class TradingEnv(gym.Env):
         super().reset(seed=seed)
         self._sim._rng        = self.np_random
         self._sim.reset()
-        self._step            = self._min_step
         self._balance         = self.initial_balance
         self._episode_trades  = []
+
+        if self.random_start and self.episode_length is not None:
+            # Pick a random window — ensure enough room for lags at the start
+            # and a full episode_length window after the start point.
+            max_start = self.n_samples - self.episode_length - self._min_step
+            if max_start < self._min_step:
+                # Dataset too short for the window — fall back to full run
+                self._start_step = self._min_step
+                self._end_step   = self.n_samples
+            else:
+                self._start_step = int(self.np_random.integers(self._min_step, max_start + 1))
+                self._end_step   = self._start_step + self.episode_length
+        else:
+            self._start_step = self._min_step
+            self._end_step   = self.n_samples
+
+        self._step = self._start_step
         return self._observation(), self._info()
 
     def step(self, action: np.ndarray):
@@ -180,13 +204,14 @@ class TradingEnv(gym.Env):
             close_price = self._current_price()
             for trade in self._sim.close_all(close_price):
                 self._episode_trades.append(trade)
-                reward += self._order_reward(OrderResult(success=True, trade=trade))
+                reward += trade.pnl / self.initial_balance
             self._balance = self.initial_balance + self._sim.cumulative_pnl
             equity        = self._balance
 
         if terminated:
-            # Terminal bonus: episodic signal for overall performance
-            reward += (equity - self.initial_balance) / self.initial_balance
+            # Terminal bonus: overall episode return as a final shaping signal.
+            # Uses only the realised balance (all positions closed above), so no double-count.
+            reward += (self._balance - self.initial_balance) / self.initial_balance
 
         obs  = self._observation()
         info = self._info(closed_trade=closed_trade, equity=equity)
@@ -201,7 +226,7 @@ class TradingEnv(gym.Env):
         price  = self._current_price()
         equity = self._balance + self._sim.total_unrealized_pnl(price)
         print(
-            f"[{self.spec.name}] step={self._step}/{self.n_samples}  "
+            f"[{self.spec.name}] step={self._step}/{self._end_step}  "
             f"balance={self._balance:.2f}  equity={equity:.2f}  "
             f"positions={self._sim.n_positions}"
         )
@@ -240,13 +265,19 @@ class TradingEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
 
-    def _order_reward(self, result: OrderResult) -> float:
+    def _order_reward(self, result: OrderResult, direction: Optional[Direction] = None) -> float:
         """
         On open:    charge estimated round-trip spread cost.
         On close:   pnl / initial_balance.
-        Invalid:    flat penalty.
+        Invalid:
+          - no_matching_lot (right direction, wrong lot tier): small penalty.
+          - everything else (no position in direction, open at cap): full penalty.
         """
         if result.invalid:
+            if result.reason == "no_matching_lot":
+                # Agent tried to close the right direction but picked the wrong lot tier.
+                # Intent is correct — apply a small nudge, not a full deterrent.
+                return -self.wrong_lot_penalty
             return -self.invalid_action_penalty
 
         if result.trade is None:
@@ -290,15 +321,16 @@ class TradingEnv(gym.Env):
         if ind.get("session",   {}).get("enabled", True):
             parts.extend(self.obs_arrays["session"][t].tolist())
 
-        # 3. Position slots: [direction, unrealized_pnl_norm, bars_open_norm] × max_positions
-        # lot_size dropped — tiers are fixed so it adds no info.
+        # 3. Position slots: [direction*lot_size, unrealized_pnl_norm, bars_open_norm] × max_positions
+        # direction*lot_size: sign encodes direction (LONG=+, SHORT=-), magnitude encodes lot tier.
+        # e.g. LONG 0.02 = +0.02, SHORT 0.05 = -0.05. Agent can infer both from one value.
         # bars_open_norm: bars held / n_samples, gives the agent a sense of trade age.
         price = self._current_price()
         for i in range(self.max_positions):
             if i < len(self._sim.positions):
                 pos = self._sim.positions[i]
                 bars_open = max(0, self._step - pos.open_step)
-                parts.append(float(pos.direction))
+                parts.append(float(pos.direction) * pos.lot_size)
                 parts.append(pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance)
                 parts.append(bars_open / self.n_samples)
             else:
@@ -320,7 +352,7 @@ class TradingEnv(gym.Env):
         return float(self.raw_close[min(self._step, self.n_samples - 1)])
 
     def _is_terminated(self, equity: float) -> bool:
-        if self._step >= self.n_samples:
+        if self._step >= self._end_step:
             return True
         if equity < self.initial_balance * 0.5:
             logger.debug("Margin call at step %d.", self._step)

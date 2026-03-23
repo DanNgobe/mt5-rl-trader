@@ -18,6 +18,16 @@ environment:
   # range: [0.2, 0.5] — tighter = more episodes, looser = agent can dig deeper holes
   max_drawdown_pct: 0.5
 
+  # Training episode window length in bars. A random start index is chosen each reset()
+  # so the agent sees different slices of the dataset. Shorter = faster credit assignment.
+  # Set to null to use the full dataset (evaluation behaviour).
+  # range: [200, 1000] for H1 data — 500 ≈ 3 weeks of bars
+  episode_length: 500
+
+  # Whether to randomise the episode start index each reset (training only).
+  # Evaluator always uses random_start: false to run the full dataset.
+  random_start: true
+
 
 # Data Configuration
 # ==================
@@ -41,6 +51,12 @@ reward:
   # range: [0.0001, 0.005] — too high biases toward never trading
   invalid_action_penalty: 0.001
 
+  # Penalty for close actions where the direction is correct but lot tier doesn't match
+  # any open position. Agent intent is right — this is a soft nudge to pick the right tier.
+  # Should be well below invalid_action_penalty so closing is never "dangerous" to attempt.
+  # range: [0.00005, 0.0003]
+  wrong_lot_penalty: 0.0002
+
   # Per-step cost per lot held. Discourages holding losers and overtrading.
   # At 0.01 lot this costs 0.000001/step — a 100-bar trade costs 0.0001 total.
   # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
@@ -49,7 +65,7 @@ reward:
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
   # range: [0.0, 0.00005]
-  flat_penalty_per_step: 0.00005
+  flat_penalty_per_step: 0.00001
 
   # Spread cost multiplier on open. 2.0 = full round-trip charged upfront.
   # range: [1.0, 2.0] — 1.0 charges only the open leg, 2.0 is most conservative
@@ -128,7 +144,7 @@ agent:
 
   # Discount factor. High because forex rewards are sparse and long-horizon.
   # range: [0.95, 0.999] — lower if episodes are short (<200 steps)
-  gamma: 0.99
+  gamma: 0.98
 
   # GAE lambda. Controls bias/variance tradeoff in advantage estimation.
   # range: [0.9, 0.99]

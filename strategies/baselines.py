@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
+from core.simulator import Direction
 from .base import BaseStrategy
 
 if TYPE_CHECKING:
@@ -155,7 +156,7 @@ class MACrossStrategy(BaseStrategy):
         positions   = env._sim.positions
 
         if crossover_up:
-            has_short = any(p.direction.name == "SHORT" for p in positions)
+            has_short = any(p.direction == Direction.SHORT for p in positions)
             if has_short:
                 self._pending_action = self._buy(self._lot_tier)
                 return self._close_short(self._lot_tier)
@@ -163,7 +164,7 @@ class MACrossStrategy(BaseStrategy):
                 return self._buy(self._lot_tier)
 
         elif crossover_down:
-            has_long = any(p.direction.name == "LONG" for p in positions)
+            has_long = any(p.direction == Direction.LONG for p in positions)
             if has_long:
                 self._pending_action = self._sell(self._lot_tier)
                 return self._close_long(self._lot_tier)

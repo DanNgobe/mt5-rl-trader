@@ -184,7 +184,7 @@ def obs_dim_from_config(obs_cfg: dict, max_positions: int) -> int:
     if ind.get("momentum", {}).get("enabled", True):
         dim += len(ind["momentum"].get("periods", [5, 20, 50]))
     if ind.get("session",  {}).get("enabled", True):  dim += 4
-    dim += max_positions * 3   # [direction, lot_norm, upnl_norm] per slot
+    dim += max_positions * 3   # [direction*lot_size, upnl_norm, bars_open_norm] per slot
     dim += 2                   # balance_norm, equity_norm
     return dim
 

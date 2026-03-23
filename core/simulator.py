@@ -244,13 +244,19 @@ class TradeSimulator:
 
         Returns OrderResult(invalid=True) if no matching position exists.
         """
+        # Check if any position exists in this direction at all
+        has_direction = any(p.direction == direction for p in self._positions)
+        if not has_direction:
+            logger.debug("CLOSE_%s: no position in this direction.", direction.name)
+            return OrderResult(success=False, invalid=True, reason="no_position_in_direction")
+
         target = next(
             (p for p in self._positions
              if p.direction == direction and abs(p.lot_size - lot_size) < 1e-9),
             None,
         )
         if target is None:
-            logger.debug("CLOSE_%s %.2f lots: no matching position.", direction.name, lot_size)
+            logger.debug("CLOSE_%s %.2f lots: direction exists but lot tier mismatch.", direction.name, lot_size)
             return OrderResult(success=False, invalid=True, reason="no_matching_lot")
 
         fill, spread_paid, slippage = self._fill_close(market_price, target.direction)

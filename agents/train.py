@@ -57,6 +57,9 @@ def _make_env_fn(
             holding_cost_per_lot   = reward_cfg.get("holding_cost_per_lot", 0.0001),
             flat_penalty_per_step  = reward_cfg.get("flat_penalty_per_step", 0.0),
             spread_cost_scale      = reward_cfg.get("spread_cost_scale", 2.0),
+            wrong_lot_penalty      = reward_cfg.get("wrong_lot_penalty", 0.0002),
+            episode_length         = env_config.get("episode_length"),
+            random_start           = env_config.get("random_start", False),
             render_mode            = None,
         )
         env.reset(seed=seed)
