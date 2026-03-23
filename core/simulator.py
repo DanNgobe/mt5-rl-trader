@@ -62,6 +62,7 @@ class Position:
     # Maximum favourable / adverse excursion prices (updated each step)
     mfe_price:   float = 0.0  # best price reached in trade's favour
     mae_price:   float = 0.0  # worst price reached against the trade
+    open_step:   int   = 0    # env step at which this position was opened
 
     def __post_init__(self):
         # Initialise excursion prices to entry so first update is correct
@@ -210,7 +211,8 @@ class TradeSimulator:
         price_diff = (exit_ - entry) if direction == Direction.LONG else (entry - exit_)
         return price_diff * lot_size * self.spec.contract_size
 
-    def open_position(self, market_price: float, direction: Direction, lot_size: float) -> OrderResult:
+    def open_position(self, market_price: float, direction: Direction, lot_size: float,
+                      open_step: int = 0) -> OrderResult:
         """
         Open a new position at market price.
 
@@ -229,6 +231,7 @@ class TradeSimulator:
             open_price  = market_price,
             spread_paid = spread_paid,
             slippage    = slippage,
+            open_step   = open_step,
         )
         self._positions.append(pos)
         self._next_ticket += 1

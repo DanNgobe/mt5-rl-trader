@@ -2,203 +2,186 @@
 # ==================================
 
 environment:
-  # Observation window size (number of candles)
-  window_size: 10
-  
   # Initial account balance
-  initial_balance: 10000.0
-  
+  initial_balance: 1000.0
+
   # Trade simulator settings
-  spread: 0.0001          # 1 pip for EURUSD
-  slippage_prob: 0.3      # 30% chance of slippage
-  slippage_range: [0.00001, 0.0005]  # 0.1 to 5 pips
-  
+  spread: 0.0001                     # 1 pip for EURUSD
+  slippage_prob: 0.3                 # range: [0.1, 0.5] — higher = more realistic, harder to train
+  slippage_range: [0.00001, 0.0005]  # range: [0.00001, 0.001] — upper bound is ~10 pips
+
   # Hard cap on simultaneous open positions
+  # range: [1, 5] — more positions = richer hedging but larger obs space and harder credit assignment
   max_positions: 3
 
-  # Episode termination
-  max_drawdown_pct: 0.5   # 50% drawdown triggers margin call
+  # Episode termination: equity drawdown fraction that triggers margin call
+  # range: [0.2, 0.5] — tighter = more episodes, looser = agent can dig deeper holes
+  max_drawdown_pct: 0.5
 
 
 # Data Configuration
 # ==================
 data:
-  # Path to raw data files
   raw_data_dir: data/raw
-  
-  # Path for processed data
   processed_data_dir: data/processed
-  
-  # Data columns (in order)
   columns: [open, high, low, close, volume]
-  
-  # Timeframe for data
   timeframe: H1  # H1, H4, D1, etc.
 
-  # Bars per year — used for Sharpe ratio annualisation.
-  # Common values: M1=378000, M5=75600, M15=25200, M30=12600,
-  #                H1=6048, H4=1512, D1=252, W1=52
+  # Bars per year for Sharpe annualisation.
+  # M1=378000  M5=75600  M15=25200  M30=12600  H1=6048  H4=1512  D1=252  W1=52
   bars_per_year: 6048
 
 
 # Reward Configuration
 # =====================
 reward:
-  # Flat penalty applied when the agent attempts an illegal action
-  # (opening at max_positions, closing a lot tier with no open position)
-  invalid_action_penalty: -0.01
+  # Penalty for illegal actions (open at max_positions, close with no matching position).
+  # Should sit between a typical small win and a typical small loss in pnl/ib terms.
+  # At 0.01 lot / 10k balance: 10-pip win ≈ 0.0001, 50-pip win ≈ 0.0005.
+  # range: [0.0001, 0.005] — too high biases toward never trading
+  invalid_action_penalty: 0.001
 
-  # Scales how much the agent is penalised for the worst drawdown
-  # during a trade (MAE). 1.0 = full weight, 0.0 = ignore.
-  drawdown_penalty_scale: 1.0
+  # Per-step cost per lot held. Discourages holding losers and overtrading.
+  # At 0.01 lot this costs 0.000001/step — a 100-bar trade costs 0.0001 total.
+  # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
+  holding_cost_per_lot: 0.0001
 
-  # Scales how much the agent is penalised for leaving profit on the
-  # table vs the best price reached (MFE). Uses capture ratio so only
-  # fires when MFE was positive. 0.5 = half weight.
-  missed_profit_scale: 0.5
+  # Per-step penalty when flat (no open positions). Nudges agent to engage.
+  # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
+  # range: [0.0, 0.00005]
+  flat_penalty_per_step: 0.00005
 
-  # Scales the per-step shaping reward based on unrealized PnL delta.
-  # Encourages closing deteriorating positions without dominating the
-  # sparse close reward. Keep small (0.05–0.2).
-  step_reward_scale: 0.1
-
+  # Spread cost multiplier on open. 2.0 = full round-trip charged upfront.
+  # range: [1.0, 2.0] — 1.0 charges only the open leg, 2.0 is most conservative
+  spread_cost_scale: 2.0
 
 
 # Observation Configuration
 # =========================
 observation:
-  # Sparse lag indices — bars back from current step.
-  # [1,2,4,8,24] covers 1h to 24h with exponential spacing.
+  # Sparse lag indices (bars back). Exponential spacing gives multi-scale price context.
+  # range: any subset of [1,2,4,8,16,24,48] — more lags = richer history, larger obs
   price_lags: [1, 2, 4, 8, 24]
 
   indicators:
     rsi:
       enabled: true
-      period: 14
+      period: 14        # range: [7, 21] — shorter = noisier, longer = smoother
 
     atr:
       enabled: true
-      period: 14
+      period: 14        # range: [7, 21]
 
     ema_ratio:
       enabled: true
-      fast: 8
-      slow: 21
+      fast: 8           # range: [5, 12]
+      slow: 21          # range: [18, 50] — keep slow > 2x fast
 
     bollinger:
       enabled: true
-      period: 20
-      std_dev: 2.0
+      period: 20        # range: [10, 30]
+      std_dev: 2.0      # range: [1.5, 2.5]
 
     momentum:
       enabled: true
-      periods: [5, 20, 50]   # one feature per period
+      periods: [5, 20, 50]   # range: any 2–4 values spanning short/medium/long term
 
     session:
-      enabled: true           # hour_sin, hour_cos, dow_sin, dow_cos
+      enabled: true     # hour_sin, hour_cos, dow_sin, dow_cos — free 4 features, keep on
 
 
-# ===========================
+# Preprocessing
+# =============
 preprocessing:
-  # Price normalization method: log_return, relative, zscore
-  price_method: log_return
-
-  # Volume normalization method: log, minmax, zscore
-  volume_method: log
+  price_method: log_return   # log_return | relative | zscore
+  volume_method: log         # log | minmax | zscore
 
 
 # PPO Agent Hyperparameters
 # =========================
 agent:
-  # Algorithm
   algorithm: PPO
-  
-  # Policy network
   policy: MlpPolicy
-  
-  # Network architecture — sized for 27-feature obs space
+
+  # Network architecture. Scale up if obs space grows significantly.
+  # range: [64,64] to [256,256] — deeper rarely helps for tabular obs
   policy_kwargs:
     net_arch:
-      - 64
-      - 64
-  
-  # Learning rate
+      - 128
+      - 128
+
+  # Learning rate. With VecNormalize active you can afford slightly higher.
+  # range: [0.00005, 0.001] — anneal if training is unstable
   learning_rate: 0.0003
-  
-  # Number of steps to run for each environment per update
+
+  # Steps per env per update. Larger = more stable gradient estimates.
+  # range: [512, 4096] — increase if episodes are long (>1000 steps)
   n_steps: 2048
-  
-  # Batch size for training
-  batch_size: 64
-  
-  # Number of epochs when updating the policy
+
+  # Minibatch size. Must divide n_steps * n_envs evenly.
+  # range: [64, 512]
+  batch_size: 128
+
+  # Gradient update passes per rollout.
+  # range: [5, 20] — more epochs risks overfitting the rollout buffer
   n_epochs: 10
-  
-  # Discount factor
+
+  # Discount factor. High because forex rewards are sparse and long-horizon.
+  # range: [0.95, 0.999] — lower if episodes are short (<200 steps)
   gamma: 0.99
-  
-  # Factor for advantage estimation
+
+  # GAE lambda. Controls bias/variance tradeoff in advantage estimation.
+  # range: [0.9, 0.99]
   gae_lambda: 0.95
-  
-  # Clipping parameter
+
+  # PPO clip range. Standard value — widen slightly if policy changes too slowly.
+  # range: [0.1, 0.3]
   clip_range: 0.2
-  
-  # Entropy coefficient
-  ent_coef: 0.05
-  
-  # Value function coefficient
+
+  # Entropy coefficient. Encourages exploration — important early in training.
+  # range: [0.001, 0.05] — reduce if policy collapses to one action
+  ent_coef: 0.01
+
+  # Value function loss coefficient.
+  # range: [0.25, 1.0]
   vf_coef: 0.5
-  
-  # Maximum gradient norm
+
+  # Gradient clipping. Prevents exploding gradients.
+  # range: [0.3, 1.0]
   max_grad_norm: 0.5
-  
-  # PPO clip range for value function
-  clip_range_vf: null  # No clipping by default
-  
-  # Normalize advantage
+
+  clip_range_vf: null      # null = no VF clipping; set to 0.2 if value loss spikes
   normalize_advantage: true
-  
-  # Target KL divergence
-  target_kl: null
+  target_kl: 0.02          # range: [0.01, 0.05] — null to disable early stopping
 
 
 # Training Configuration
 # ======================
 training:
-  # Total timesteps to train
-  total_timesteps: 1000000
-  
-  # Random seed
+  # Sparse rewards need more timesteps than dense-reward envs.
+  # range: [500k, 5M] depending on episode length and n_envs
+  total_timesteps: 2000000
+
   seed: 42
-  
-  # TensorBoard log directory
   log_dir: logs
-  
-  # Model checkpoint directory
   model_dir: models
-  
-  # Save checkpoint every N timesteps
+
+  # Checkpoint every N timesteps.
+  # range: [50000, 200000]
   save_freq: 100000
-  
-  # Evaluate every N timesteps (0 to disable)
+
+  # Eval every N timesteps. 0 to disable.
+  # range: [25000, 100000]
   eval_freq: 50000
-  
-  # Number of evaluation episodes
-  n_eval_episodes: 5
-  
-  # Verbose level (0: silent, 1: info, 2: debug)
+
+  n_eval_episodes: 10   # range: [5, 20] — more = stable eval metric
   verbose: 1
 
 
 # Evaluation Configuration
 # ========================
 evaluation:
-  # Number of episodes to run
   n_episodes: 100
-  
-  # Render during evaluation (for visualization)
   render: false
-  
-  # Save evaluation results
   save_results: true
   results_dir: data/evaluation

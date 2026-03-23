@@ -105,10 +105,10 @@ class Evaluator:
                 max_positions          = self.env_cfg.get("max_positions", 3),
                 slippage_prob          = self.env_cfg["slippage_prob"],
                 slippage_range         = tuple(self.env_cfg["slippage_range"]),
-                invalid_action_penalty = self._reward_cfg.get("invalid_action_penalty", -0.01),
-                drawdown_penalty_scale = self._reward_cfg.get("drawdown_penalty_scale", 1.0),
-                missed_profit_scale    = self._reward_cfg.get("missed_profit_scale", 0.5),
-                step_reward_scale      = self._reward_cfg.get("step_reward_scale", 0.1),
+                invalid_action_penalty = self._reward_cfg.get("invalid_action_penalty", 0.001),
+                holding_cost_per_lot   = self._reward_cfg.get("holding_cost_per_lot", 0.0001),
+                flat_penalty_per_step  = self._reward_cfg.get("flat_penalty_per_step", 0.0),
+                spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
                 render_mode            = None,
             )
 

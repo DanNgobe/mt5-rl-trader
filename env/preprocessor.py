@@ -102,13 +102,13 @@ def compute_ema_ratio(close: np.ndarray, fast: int = 8, slow: int = 21) -> np.nd
     """
     EMA(fast)/EMA(slow) - 1.
     Positive = fast above slow (uptrend), negative = downtrend.
-    Clipped to [-0.05, 0.05] to bound outliers.
+    Clipped to [-0.1, 0.1] to bound outliers.
     """
     close     = np.asarray(close, dtype=np.float64)
     ema_fast  = _ema(close, fast)
     ema_slow  = _ema(close, slow)
     ratio     = ema_fast / np.where(ema_slow > 0, ema_slow, 1.0) - 1.0
-    return np.clip(ratio, -0.05, 0.05).astype(np.float32)
+    return np.clip(ratio, -0.1, 0.1).astype(np.float32)
 
 
 def compute_bollinger_pct(close: np.ndarray, period: int = 20,

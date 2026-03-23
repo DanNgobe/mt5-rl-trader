@@ -21,7 +21,7 @@ from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     EvalCallback,
 )
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 from core.config import load_config, load_symbol_spec
 from env.preprocessor import load_symbol_files
@@ -53,10 +53,10 @@ def _make_env_fn(
             max_positions          = env_config.get("max_positions", 3),
             slippage_prob          = env_config["slippage_prob"],
             slippage_range         = tuple(env_config["slippage_range"]),
-            invalid_action_penalty = reward_cfg.get("invalid_action_penalty", -0.01),
-            drawdown_penalty_scale = reward_cfg.get("drawdown_penalty_scale", 1.0),
-            missed_profit_scale    = reward_cfg.get("missed_profit_scale", 0.5),
-            step_reward_scale      = reward_cfg.get("step_reward_scale", 0.1),
+            invalid_action_penalty = reward_cfg.get("invalid_action_penalty", 0.001),
+            holding_cost_per_lot   = reward_cfg.get("holding_cost_per_lot", 0.0001),
+            flat_penalty_per_step  = reward_cfg.get("flat_penalty_per_step", 0.0),
+            spread_cost_scale      = reward_cfg.get("spread_cost_scale", 2.0),
             render_mode            = None,
         )
         env.reset(seed=seed)
@@ -209,8 +209,8 @@ def train(
         ))
 
     VecEnvCls = DummyVecEnv if len(env_fns) == 1 else SubprocVecEnv
-    vec_env   = VecEnvCls(env_fns)
-    eval_env  = VecEnvCls(eval_env_fns)
+    vec_env   = VecNormalize(VecEnvCls(env_fns),  norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env  = VecNormalize(VecEnvCls(eval_env_fns), norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir   = Path(train_cfg["log_dir"]) / f"ppo_{timestamp}"
@@ -261,6 +261,9 @@ def train(
     ]
 
     if train_cfg.get("eval_freq", 0) > 0:
+        # Sync eval_env normalisation stats from training env before each eval
+        eval_env.obs_rms    = vec_env.obs_rms
+        eval_env.ret_rms    = vec_env.ret_rms
         callbacks.append(
             EvalCallback(
                 eval_env,
@@ -281,7 +284,9 @@ def train(
 
     final_path = model_dir / "ppo_trading_final.zip"
     model.save(str(final_path))
+    vec_env.save(str(model_dir / "vecnormalize.pkl"))
     log.info("Final model saved → %s", final_path)
+    log.info("VecNormalize stats → %s", model_dir / "vecnormalize.pkl")
 
     vec_env.close()
     eval_env.close()
