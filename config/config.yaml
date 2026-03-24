@@ -6,7 +6,6 @@ environment:
   initial_balance: 1000.0
 
   # Trade simulator settings
-  spread: 0.0001                     # 1 pip for EURUSD
   slippage_prob: 0.3                 # range: [0.1, 0.5] — higher = more realistic, harder to train
   slippage_range: [0.00001, 0.0005]  # range: [0.00001, 0.001] — upper bound is ~10 pips
 
@@ -14,9 +13,10 @@ environment:
   # range: [1, 5] — more positions = richer hedging but larger obs space and harder credit assignment
   max_positions: 3
 
-  # Episode termination: equity drawdown fraction that triggers margin call
+  # Episode termination: equity drawdown fraction that triggers margin call.
+  # 0.5 = episode ends when equity drops to 50% of initial_balance.
   # range: [0.2, 0.5] — tighter = more episodes, looser = agent can dig deeper holes
-  max_drawdown_pct: 0.5
+  max_drawdown_pct: 0.3
 
   # Training episode window length in bars. A random start index is chosen each reset()
   # so the agent sees different slices of the dataset. Shorter = faster credit assignment.
@@ -55,17 +55,19 @@ reward:
   # any open position. Agent intent is right — this is a soft nudge to pick the right tier.
   # Should be well below invalid_action_penalty so closing is never "dangerous" to attempt.
   # range: [0.00005, 0.0003]
-  wrong_lot_penalty: 0.0002
+  wrong_lot_penalty: 0.001
 
   # Per-step cost per lot held. Discourages holding losers and overtrading.
   # At 0.01 lot this costs 0.000001/step — a 100-bar trade costs 0.0001 total.
   # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
-  holding_cost_per_lot: 0.0001
+  holding_cost_per_lot: 0.00001
 
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
+  # Must be less than holding_cost_per_lot * min_lot (0.0001 * 0.01 = 0.000001)
+  # so holding even the smallest position is cheaper than sitting flat.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
-  # range: [0.0, 0.00005]
-  flat_penalty_per_step: 0.00001
+  # range: [0.0, 0.0000005]
+  flat_penalty_per_step: 0.0
 
   # Spread cost multiplier on open. 2.0 = full round-trip charged upfront.
   # range: [1.0, 2.0] — 1.0 charges only the open leg, 2.0 is most conservative

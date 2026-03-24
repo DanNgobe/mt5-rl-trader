@@ -63,6 +63,9 @@ class RandomStrategy(BaseStrategy):
         pass
 
     def act(self, env: "TradingEnv") -> np.ndarray:
+        # Note: random actions will frequently be invalid (open at cap, close
+        # with no position, etc.) and hit the invalid_action_penalty. This is
+        # intentional — it's the absolute floor baseline, not a fair strategy.
         direction = int(self._rng.integers(0, 5))   # 0-4 inclusive
         return np.array([direction, self._lot_tier], dtype=np.int32)
 
@@ -156,18 +159,25 @@ class MACrossStrategy(BaseStrategy):
         positions   = env._sim.positions
 
         if crossover_up:
-            has_short = any(p.direction == Direction.SHORT for p in positions)
-            if has_short:
+            short_pos = next((p for p in positions if p.direction == Direction.SHORT), None)
+            if short_pos is not None:
+                # Match the actual lot tier of the open position to avoid invalid close
+                from core.simulator import LOT_TIERS
+                close_tier = min(range(len(LOT_TIERS)),
+                                 key=lambda i: abs(LOT_TIERS[i] - short_pos.lot_size))
                 self._pending_action = self._buy(self._lot_tier)
-                return self._close_short(self._lot_tier)
+                return self._close_short(close_tier)
             elif n_positions == 0:
                 return self._buy(self._lot_tier)
 
         elif crossover_down:
-            has_long = any(p.direction == Direction.LONG for p in positions)
-            if has_long:
+            long_pos = next((p for p in positions if p.direction == Direction.LONG), None)
+            if long_pos is not None:
+                from core.simulator import LOT_TIERS
+                close_tier = min(range(len(LOT_TIERS)),
+                                 key=lambda i: abs(LOT_TIERS[i] - long_pos.lot_size))
                 self._pending_action = self._sell(self._lot_tier)
-                return self._close_long(self._lot_tier)
+                return self._close_long(close_tier)
             elif n_positions == 0:
                 return self._sell(self._lot_tier)
 

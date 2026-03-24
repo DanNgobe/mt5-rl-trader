@@ -15,7 +15,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import yaml
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from core.agent import BaseAgent
@@ -23,6 +22,12 @@ from core.config import load_config, load_symbol_spec
 from core.metrics import calculate_metrics, print_metrics, save_results
 from env.preprocessor import build_obs_arrays, load_csv, load_npy, preprocess
 from env.trading_env import TradingEnv
+
+try:
+    from sb3_contrib.common.wrappers import ActionMasker
+    _HAS_MASKER = True
+except ImportError:
+    _HAS_MASKER = False
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +101,7 @@ class Evaluator:
         # Build env
         # ------------------------------------------------------------------
         def _make_env():
-            return TradingEnv(
+            env = TradingEnv(
                 obs_arrays             = obs_arrays,
                 raw_close              = raw_close,
                 symbol_spec            = symbol_spec,
@@ -110,11 +115,15 @@ class Evaluator:
                 flat_penalty_per_step  = self._reward_cfg.get("flat_penalty_per_step", 0.0),
                 spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
                 wrong_lot_penalty      = self._reward_cfg.get("wrong_lot_penalty", 0.0002),
+                max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
                 render_mode            = None,
             )
+            if _HAS_MASKER:
+                env = ActionMasker(env, lambda e: e.action_masks())
+            return env
 
         vec_env   = DummyVecEnv([_make_env])
-        inner_env: TradingEnv = vec_env.envs[0]
+        inner_env: TradingEnv = vec_env.envs[0].env if _HAS_MASKER else vec_env.envs[0]
 
         # ------------------------------------------------------------------
         # Optional visualiser
@@ -143,7 +152,6 @@ class Evaluator:
 
             done         = False
             equity_curve = [inner_env._balance]
-            prev_equity  = inner_env._balance
 
             while not done:
                 action = agent.act(inner_env)
@@ -154,7 +162,6 @@ class Evaluator:
 
                 price  = inner_env._current_price()
                 equity = inner_env._balance + inner_env._sim.total_unrealized_pnl(price)
-                prev_equity = equity
 
                 if vis is not None:
                     vis.update(inner_env, float(rewards[0]), action=action)
@@ -170,6 +177,15 @@ class Evaluator:
                 if done:
                     stats = inner_env.episode_stats()
                     episode_summaries.append(stats)
+
+                    # Collect forced closes from episode_stats — they don't
+                    # appear in info["closed_trade"] since they happen in bulk
+                    # at termination. Tag them so the CSV is complete.
+                    for forced_trade in inner_env._episode_trades:
+                        if forced_trade.forced:
+                            td = forced_trade.to_dict()
+                            td.update({"episode": ep + 1, "agent": agent.name})
+                            all_trades.append(td)
 
                     if vis is not None:
                         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")

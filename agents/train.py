@@ -14,14 +14,14 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import yaml
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
-    EvalCallback,
 )
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from core.config import load_config, load_symbol_spec
 from env.preprocessor import load_symbol_files
@@ -33,6 +33,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Environment factory
 # ---------------------------------------------------------------------------
+
+def _get_action_masks(env) -> np.ndarray:
+    """Top-level callable for ActionMasker — picklable for SubprocVecEnv on Windows."""
+    return env.action_masks()
+
 
 def _make_env_fn(
     obs_arrays:  dict,
@@ -58,10 +63,12 @@ def _make_env_fn(
             flat_penalty_per_step  = reward_cfg.get("flat_penalty_per_step", 0.0),
             spread_cost_scale      = reward_cfg.get("spread_cost_scale", 2.0),
             wrong_lot_penalty      = reward_cfg.get("wrong_lot_penalty", 0.0002),
+            max_drawdown_pct       = env_config.get("max_drawdown_pct", 0.5),
             episode_length         = env_config.get("episode_length"),
             random_start           = env_config.get("random_start", False),
             render_mode            = None,
         )
+        env = ActionMasker(env, _get_action_masks)
         env.reset(seed=seed)
         return env
     return _init
@@ -98,10 +105,12 @@ class TradingMetricsCallback(BaseCallback):
         win_rates = [s["win_rate"]     for s in self._episode_stats]
         trades    = [s["total_trades"] for s in self._episode_stats]
         dds       = [s["max_drawdown"] for s in self._episode_stats]
+        forced    = [s["forced_trades"] for s in self._episode_stats]
         self.logger.record("trading/mean_episode_pnl",       float(np.mean(pnls)))
         self.logger.record("trading/mean_win_rate",           float(np.mean(win_rates)))
         self.logger.record("trading/mean_trades_per_episode", float(np.mean(trades)))
         self.logger.record("trading/mean_max_drawdown",       float(np.mean(dds)))
+        self.logger.record("trading/mean_forced_closes",      float(np.mean(forced)))
         self._episode_stats.clear()
 
 
@@ -109,7 +118,7 @@ class TradingMetricsCallback(BaseCallback):
 # ONNX export
 # ---------------------------------------------------------------------------
 
-def export_onnx(model: PPO, output_path: str, obs_dim: int) -> bool:
+def export_onnx(model: MaskablePPO, output_path: str, obs_dim: int) -> bool:
     """Export the trained SB3 policy to ONNX for MT5 deployment."""
     try:
         import torch
@@ -177,7 +186,7 @@ def train(
     output_dir:      str                  = "models",
     total_timesteps: Optional[int]        = None,
     seed:            int                  = 42,
-) -> PPO:
+) -> MaskablePPO:
     config      = load_config(config_path)
     env_cfg     = config["environment"]
     train_cfg   = config["training"]
@@ -212,8 +221,8 @@ def train(
         ))
 
     VecEnvCls = DummyVecEnv if len(env_fns) == 1 else SubprocVecEnv
-    vec_env   = VecNormalize(VecEnvCls(env_fns),  norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env  = VecNormalize(VecEnvCls(eval_env_fns), norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
+    vec_env   = VecEnvCls(env_fns)
+    eval_env  = VecEnvCls(eval_env_fns)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir   = Path(train_cfg["log_dir"]) / f"ppo_{timestamp}"
@@ -227,10 +236,10 @@ def train(
 
     if model_path is not None:
         log.info("Continuing training from %s", model_path)
-        model = PPO.load(model_path, env=vec_env)
+        model = MaskablePPO.load(model_path, env=vec_env)
     else:
-        log.info("Building new PPO model.")
-        model = PPO(
+        log.info("Building new MaskablePPO model.")
+        model = MaskablePPO(
             policy              = agent_cfg["policy"],
             env                 = vec_env,
             learning_rate       = agent_cfg["learning_rate"],
@@ -264,11 +273,8 @@ def train(
     ]
 
     if train_cfg.get("eval_freq", 0) > 0:
-        # Sync eval_env normalisation stats from training env before each eval
-        eval_env.obs_rms    = vec_env.obs_rms
-        eval_env.ret_rms    = vec_env.ret_rms
         callbacks.append(
-            EvalCallback(
+            MaskableEvalCallback(
                 eval_env,
                 best_model_save_path = str(model_dir),
                 log_path             = str(log_dir),
@@ -287,9 +293,7 @@ def train(
 
     final_path = model_dir / "ppo_trading_final.zip"
     model.save(str(final_path))
-    vec_env.save(str(model_dir / "vecnormalize.pkl"))
     log.info("Final model saved → %s", final_path)
-    log.info("VecNormalize stats → %s", model_dir / "vecnormalize.pkl")
 
     vec_env.close()
     eval_env.close()

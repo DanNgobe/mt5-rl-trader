@@ -150,7 +150,8 @@ def save_results(
 
     if equity_curves:
         ef = base / f"equity_curve_{ts}.npy"
-        np.save(ef, equity_curves[-1])
+        # Save all episodes as an object array so shapes can differ between episodes
+        np.save(ef, np.array(equity_curves, dtype=object))
         log.info("Equity    → %s", ef)
 
     summary = {

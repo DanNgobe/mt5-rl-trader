@@ -72,6 +72,7 @@ class TradingEnv(gym.Env):
         flat_penalty_per_step:   float = 0.0,
         spread_cost_scale:       float = 2.0,
         wrong_lot_penalty:       float = 0.0002,
+        max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
         random_start:            bool  = False,
         render_mode:             Optional[str] = None,
@@ -96,6 +97,7 @@ class TradingEnv(gym.Env):
         self.flat_penalty_per_step  = flat_penalty_per_step
         self.spread_cost_scale      = spread_cost_scale
         self.wrong_lot_penalty      = wrong_lot_penalty
+        self.max_drawdown_pct       = max_drawdown_pct
         self.episode_length         = episode_length
         self.random_start           = random_start
 
@@ -161,6 +163,10 @@ class TradingEnv(gym.Env):
         reward       = 0.0
         closed_trade = None
 
+        # Update excursions first so MFE/MAE reflect the current bar's price
+        # before any close (including terminal close_all) reads them.
+        self._sim.update_excursions(current_price)
+
         if direction_action == Action.BUY:
             result = self._sim.open_position(current_price, Direction.LONG, lot_size, self._step)
             reward = self._order_reward(result)
@@ -183,8 +189,6 @@ class TradingEnv(gym.Env):
                 closed_trade = result.trade
                 self._episode_trades.append(closed_trade)
 
-        self._sim.update_excursions(current_price)
-
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
@@ -204,7 +208,9 @@ class TradingEnv(gym.Env):
             close_price = self._current_price()
             for trade in self._sim.close_all(close_price):
                 self._episode_trades.append(trade)
-                reward += trade.pnl / self.initial_balance
+                # Do NOT add trade.pnl here — the terminal bonus below uses
+                # final balance which already includes these PnLs via cumulative_pnl.
+                # Adding them here would double-count every forced close.
             self._balance = self.initial_balance + self._sim.cumulative_pnl
             equity        = self._balance
 
@@ -235,29 +241,100 @@ class TradingEnv(gym.Env):
         pass
 
     # ------------------------------------------------------------------
+    # Action masking (MaskablePPO / sb3-contrib)
+    # ------------------------------------------------------------------
+
+    def action_masks(self) -> np.ndarray:
+        """
+        Return a boolean mask over the MultiDiscrete([5, 3]) action space.
+        
+        MaskablePPO expects shape (n_actions_per_dim,) = (5+3,) = (8,).
+        Structure: [dir_mask (5 elements), lot_mask (3 elements)]
+          - dir_mask[i]: whether direction i is valid
+          - lot_mask[j]: whether lot tier j is valid
+        
+        Masking rules for direction:
+          - HOLD (0): always valid
+          - BUY (1): valid only if not at max_positions
+          - SELL (2): valid only if not at max_positions
+          - CLOSE_LONG (3): valid only if long position(s) exist
+          - CLOSE_SHORT (4): valid only if short position(s) exist
+        
+        For lot tiers: we allow all tiers universally, since MaskablePPO
+        doesn't natively support joint masking (lot validity depends on direction).
+        The environment will reject invalid lot-direction combinations via
+        the reward penalty system.
+        """
+        positions   = self._sim.positions
+        at_cap      = self._sim.n_positions >= self.max_positions
+        has_long    = any(p.direction == Direction.LONG for p in positions)
+        has_short   = any(p.direction == Direction.SHORT for p in positions)
+
+        # Mask for 5 direction choices
+        dir_mask = np.array([
+            True,           # Action.HOLD: always valid
+            not at_cap,     # Action.BUY: valid if not at capacity
+            not at_cap,     # Action.SELL: valid if not at capacity
+            has_long,       # Action.CLOSE_LONG: valid if longs exist
+            has_short,      # Action.CLOSE_SHORT: valid if shorts exist
+        ], dtype=bool)
+
+        # Mask for 3 lot tier choices (all always valid at this level)
+        # Individual lot matching for CLOSE actions is handled via reward penalties
+        lot_mask = np.ones(3, dtype=bool)
+
+        # Concatenate direction and lot masks
+        return np.concatenate([dir_mask, lot_mask])
+
+    # ------------------------------------------------------------------
     # Episode stats
     # ------------------------------------------------------------------
 
     def episode_stats(self) -> dict:
-        trades = self._episode_trades
-        if not trades:
+        all_trades = self._episode_trades
+        vol_trades = [t for t in all_trades if not t.forced]   # agent-chosen closes
+        frc_trades = [t for t in all_trades if t.forced]       # episode-end forced closes
+
+        def _trade_stats(trades) -> dict:
+            if not trades:
+                return {"count": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+                        "total_pnl": 0.0, "avg_pnl": 0.0}
+            pnls = np.array([t.pnl for t in trades])
+            wins = int((pnls > 0).sum())
             return {
-                "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
-                "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
-                "max_drawdown": 0.0, "final_balance": self._balance,
+                "count":     len(trades),
+                "wins":      wins,
+                "losses":    len(trades) - wins,
+                "win_rate":  wins / len(trades),
+                "total_pnl": float(pnls.sum()),
+                "avg_pnl":   float(pnls.mean()),
             }
-        pnls   = np.array([t.pnl for t in trades])
-        wins   = int((pnls > 0).sum())
-        cumsum = np.cumsum(pnls)
-        peak   = np.maximum.accumulate(cumsum)
+
+        vol_stats = _trade_stats(vol_trades)
+        frc_stats = _trade_stats(frc_trades)
+
+        # Drawdown uses all trades (forced closes affect real equity)
+        if all_trades:
+            all_pnls = np.array([t.pnl for t in all_trades])
+            cumsum   = np.cumsum(all_pnls)
+            peak     = np.maximum.accumulate(cumsum)
+            max_dd   = float(np.max(peak - cumsum))
+        else:
+            max_dd = 0.0
+
         return {
-            "total_trades":   len(trades),
-            "winning_trades": wins,
-            "losing_trades":  len(trades) - wins,
-            "win_rate":       wins / len(trades),
-            "total_pnl":      float(pnls.sum()),
-            "avg_pnl":        float(pnls.mean()),
-            "max_drawdown":   float(np.max(peak - cumsum)),
+            # Voluntary (agent-chosen) trade metrics — primary quality signal
+            "total_trades":   vol_stats["count"],
+            "winning_trades": vol_stats["wins"],
+            "losing_trades":  vol_stats["losses"],
+            "win_rate":       vol_stats["win_rate"],
+            "total_pnl":      vol_stats["total_pnl"],
+            "avg_pnl":        vol_stats["avg_pnl"],
+            # Forced close summary — informational
+            "forced_trades":      frc_stats["count"],
+            "forced_total_pnl":   frc_stats["total_pnl"],
+            # Financial metrics include everything
+            "max_drawdown":   max_dd,
             "final_balance":  self._balance,
         }
 
@@ -322,13 +399,13 @@ class TradingEnv(gym.Env):
             parts.extend(self.obs_arrays["session"][t].tolist())
 
         # 3. Position slots: [direction*lot_size, unrealized_pnl_norm, bars_open_norm] × max_positions
-        # direction*lot_size: sign encodes direction (LONG=+, SHORT=-), magnitude encodes lot tier.
-        # e.g. LONG 0.02 = +0.02, SHORT 0.05 = -0.05. Agent can infer both from one value.
-        # bars_open_norm: bars held / n_samples, gives the agent a sense of trade age.
+        # Sorted by ticket to guarantee stable slot assignment — closing a position never
+        # shifts remaining positions into different slots, preventing spurious state changes.
         price = self._current_price()
+        sorted_positions = sorted(self._sim.positions, key=lambda p: p.ticket)
         for i in range(self.max_positions):
-            if i < len(self._sim.positions):
-                pos = self._sim.positions[i]
+            if i < len(sorted_positions):
+                pos = sorted_positions[i]
                 bars_open = max(0, self._step - pos.open_step)
                 parts.append(float(pos.direction) * pos.lot_size)
                 parts.append(pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance)
@@ -354,7 +431,7 @@ class TradingEnv(gym.Env):
     def _is_terminated(self, equity: float) -> bool:
         if self._step >= self._end_step:
             return True
-        if equity < self.initial_balance * 0.5:
+        if equity < self.initial_balance * (1.0 - self.max_drawdown_pct):
             logger.debug("Margin call at step %d.", self._step)
             return True
         return False

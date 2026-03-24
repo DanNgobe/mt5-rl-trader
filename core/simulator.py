@@ -7,7 +7,7 @@ Spread and slippage are applied per-symbol via SymbolSpec.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
 
@@ -100,6 +100,7 @@ class ClosedTrade:
     slippage:    float
     mfe_pnl:     float  # P&L at the most favourable price reached
     mae_pnl:     float  # P&L at the most adverse price reached
+    forced:      bool   = False  # True when closed by episode termination, not agent choice
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +114,7 @@ class ClosedTrade:
             "slippage":    self.slippage,
             "mfe_pnl":     self.mfe_pnl,
             "mae_pnl":     self.mae_pnl,
+            "forced":      self.forced,
         }
 
 
@@ -284,11 +286,12 @@ class TradeSimulator:
         return OrderResult(success=True, trade=trade)
 
     def close_all(self, market_price: float) -> list[ClosedTrade]:
-        """Close every open position. Used at episode end."""
+        """Close every open position at episode end. All resulting trades are marked forced=True."""
         trades = []
         for pos in list(self._positions):
             result = self.close_position(market_price, pos.direction, pos.lot_size)
             if result.trade is not None:
+                result.trade.forced = True
                 trades.append(result.trade)
         return trades
 
@@ -297,18 +300,44 @@ class TradeSimulator:
 
     def position_state_vector(self, current_price: float, max_positions: int) -> np.ndarray:
         """
-        Fixed-length float32 vector of all open positions.
-        Each slot: [is_filled, direction, lot_size, entry_price_delta, unrealized_pnl]
-        Unfilled slots are zero-padded. Length = max_positions * 5.
+        Return a flat array of position slot states for visualization.
+        
+        Shape: (max_positions * 5,) — each 5-element slice represents one slot:
+          [filled, direction, lot_size, price_diff_from_entry, unrealized_pnl]
+        
+        filled: 1 if occupied, 0 if empty
+        direction: 1 (LONG), -1 (SHORT), or 0 (empty)
+        lot_size: size of the position, or 0 if empty
+        price_diff_from_entry: (current - entry) for LONG, (entry - current) for SHORT
+        unrealized_pnl: trade PnL at current price (normalized by 100 for display)
         """
+        # Pad positions to max_positions slots
         vec = np.zeros(max_positions * 5, dtype=np.float32)
+        
         for i, pos in enumerate(self._positions[:max_positions]):
-            base = i * 5
-            vec[base]     = 1.0
-            vec[base + 1] = float(pos.direction)
-            vec[base + 2] = pos.lot_size
-            vec[base + 3] = (pos.entry_price - current_price) / current_price
-            vec[base + 4] = pos.unrealized_pnl(current_price, self.spec.contract_size)
+            base_idx = i * 5
+            
+            # Slot filled flag
+            vec[base_idx + 0] = 1.0
+            
+            # Direction: 1.0 for LONG, -1.0 for SHORT
+            vec[base_idx + 1] = float(pos.direction)
+            
+            # Lot size
+            vec[base_idx + 2] = pos.lot_size
+            
+            # Price difference from entry (favourable = positive for display)
+            if pos.direction == Direction.LONG:
+                vec[base_idx + 3] = current_price - pos.entry_price
+            else:  # SHORT
+                vec[base_idx + 3] = pos.entry_price - current_price
+            
+            # Unrealized PnL (normalized for heatmap display, capped to [-1, 1])
+            upnl = pos.unrealized_pnl(current_price, self.spec.contract_size)
+            # Normalize by dividing by a scale factor (e.g., 500 for typical trades)
+            normalized_upnl = np.clip(upnl / 500.0, -1.0, 1.0)
+            vec[base_idx + 4] = normalized_upnl
+        
         return vec
 
     def reset(self) -> None:

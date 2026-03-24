@@ -309,13 +309,14 @@ def load_csv(
     return df[columns].to_numpy(dtype=np.float64), dt_index
 
 
-def load_npy(path: str | Path) -> np.ndarray:
+def load_npy(path: str | Path) -> tuple[np.ndarray, None]:
+    """Load .npy file → (raw_array, None). Returns a tuple to match load_csv's signature."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Data file not found: {path}")
     data = np.load(path)
     logger.info("Loaded %s from %s", data.shape, path.name)
-    return data
+    return data, None
 
 
 def load_and_preprocess(
@@ -330,8 +331,7 @@ def load_and_preprocess(
     """
     path = Path(path)
     if path.suffix.lower() == ".npy":
-        raw      = load_npy(path)
-        dt_index = None
+        raw, dt_index = load_npy(path)
     else:
         raw, dt_index = load_csv(path, columns=columns)
 
@@ -373,7 +373,7 @@ def load_symbol_files(
             processed, raw_close, dt_index = load_and_preprocess(fpath, columns)
             # Reconstruct raw array for indicator computation
             if fpath.suffix.lower() == ".npy":
-                raw = load_npy(fpath)
+                raw, _ = load_npy(fpath)
             else:
                 raw, _ = load_csv(fpath, columns)
 
