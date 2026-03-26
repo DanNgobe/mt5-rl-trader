@@ -72,6 +72,7 @@ class TradingEnv(gym.Env):
         flat_penalty_per_step:   float = 0.0,
         spread_cost_scale:       float = 2.0,
         wrong_lot_penalty:       float = 0.0002,
+        portfolio_offset_factor: float = 0.0,
         max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
         random_start:            bool  = False,
@@ -97,6 +98,7 @@ class TradingEnv(gym.Env):
         self.flat_penalty_per_step  = flat_penalty_per_step
         self.spread_cost_scale      = spread_cost_scale
         self.wrong_lot_penalty      = wrong_lot_penalty
+        self.portfolio_offset_factor = portfolio_offset_factor
         self.max_drawdown_pct       = max_drawdown_pct
         self.episode_length         = episode_length
         self.random_start           = random_start
@@ -345,10 +347,14 @@ class TradingEnv(gym.Env):
     def _order_reward(self, result: OrderResult, direction: Optional[Direction] = None) -> float:
         """
         On open:    charge estimated round-trip spread cost.
-        On close:   pnl / initial_balance.
+        On close:   pnl / initial_balance, optionally offset by other positions' unrealized gains.
         Invalid:
           - no_matching_lot (right direction, wrong lot tier): small penalty.
           - everything else (no position in direction, open at cap): full penalty.
+        
+        Portfolio offset (grid/martingale):
+          When closing a losing trade, reward is adjusted by other positions' unrealized PnL.
+          Formula: close_reward = trade_pnl + (portfolio_offset_factor * other_unrealized_pnl)
         """
         if result.invalid:
             if result.reason == "no_matching_lot":
@@ -361,7 +367,24 @@ class TradingEnv(gym.Env):
             # Charge spread cost upfront — scale configurable (default round-trip = 2.0)
             return -(result.position.spread_paid * self.spread_cost_scale) / self.initial_balance
 
-        return result.trade.pnl / self.initial_balance
+        # BASE CLOSE REWARD
+        trade_pnl = result.trade.pnl / self.initial_balance
+        
+        # PORTFOLIO-AWARE ADJUSTMENT (grid/martingale support)
+        if self.portfolio_offset_factor > 0 and trade_pnl < 0:
+            # Trade is losing — offset with other positions' unrealized gains
+            current_price = self._current_price()
+            other_unrealized = sum(
+                p.unrealized_pnl(current_price, self.spec.contract_size)
+                for p in self._sim.positions
+            ) / self.initial_balance
+            
+            # Only apply offset if portfolio (excluding this trade) is net positive
+            if other_unrealized > 0:
+                offset_reward = trade_pnl + (self.portfolio_offset_factor * other_unrealized)
+                return offset_reward
+        
+        return trade_pnl
 
     # ------------------------------------------------------------------
     # Observation

@@ -92,11 +92,20 @@ int OnInit()
     string common_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH)
                          + "\\Files\\" + InpModelPath;
     Print("Resolved model path: ", common_path);
-    g_onnx_handle = OnnxCreate(InpModelPath, ONNX_COMMON_FOLDER);
+    
+    // Try ONNX_DEFAULT first (may avoid CUDA issues), fallback to ONNX_COMMON_FOLDER
+    g_onnx_handle = OnnxCreate(InpModelPath, ONNX_DEFAULT);
+    if(g_onnx_handle == INVALID_HANDLE)
+    {
+        Print("ONNX_DEFAULT failed, trying ONNX_COMMON_FOLDER...");
+        g_onnx_handle = OnnxCreate(InpModelPath, ONNX_COMMON_FOLDER);
+    }
+    
     if(g_onnx_handle == INVALID_HANDLE)
     {
         Print("ERROR: OnnxCreate failed (", GetLastError(),
               ") - ensure file exists at: ", common_path);
+        Print("FIX: Re-export model.onnx with CPU execution (no CUDA)");
         return INIT_FAILED;
     }
 

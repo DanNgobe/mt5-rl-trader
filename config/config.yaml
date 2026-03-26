@@ -73,6 +73,14 @@ reward:
   # range: [1.0, 2.0] — 1.0 charges only the open leg, 2.0 is most conservative
   spread_cost_scale: 2.0
 
+  # Portfolio-aware close rewards.
+  # When closing a losing trade, offset the loss with other positions' unrealized gains.
+  # - 0.0 = trade isolation (current behavior, no offset)
+  # - 0.5 = 50% of other positions' profits offset this trade's loss
+  # - 1.0 = full offset (closing -10 pip loss is neutral if +10 pips elsewhere)
+  # range: [0.0, 1.0] — start at 0.5 for grid strategies
+  portfolio_offset_factor: 0.5
+
 
 # Observation Configuration
 # =========================
