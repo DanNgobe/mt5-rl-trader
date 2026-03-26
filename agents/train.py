@@ -61,6 +61,7 @@ def _make_env_fn(
             holding_cost_per_lot   = reward_cfg.get("holding_cost_per_lot", 0.0001),
             flat_penalty_per_step  = reward_cfg.get("flat_penalty_per_step", 0.0),
             spread_cost_scale      = reward_cfg.get("spread_cost_scale", 2.0),
+            reward_mode            = reward_cfg.get("reward_mode", "sparse"),
             portfolio_offset_factor = reward_cfg.get("portfolio_offset_factor", 0.0),
             max_drawdown_pct       = env_config.get("max_drawdown_pct", 0.5),
             episode_length         = env_config.get("episode_length"),

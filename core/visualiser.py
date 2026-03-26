@@ -568,11 +568,11 @@ class EpisodeVisualiser:
         bal      = env._balance
 
         # Show current action name prominently in the title
-        current_action_label = _ACTION_LABELS.get(
-            self._actions[-1] if self._actions else _A_HOLD, "HOLD"
+        current_action_label = self._action_labels.get(
+            self._actions[-1] if self._actions else 0, "HOLD"
         )
-        action_colour = _ACTION_COLOURS.get(
-            self._actions[-1] if self._actions else _A_HOLD, _MUTED
+        action_colour = self._action_colours.get(
+            self._actions[-1] if self._actions else 0, _MUTED
         )
 
         self._fig.suptitle(
