@@ -113,6 +113,7 @@ class Evaluator:
                 holding_cost_per_lot   = self._reward_cfg.get("holding_cost_per_lot", 0.0001),
                 flat_penalty_per_step  = self._reward_cfg.get("flat_penalty_per_step", 0.0),
                 spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
+                reward_mode            = self._reward_cfg.get("reward_mode", "sparse"),
                 portfolio_offset_factor = self._reward_cfg.get("portfolio_offset_factor", 0.0),
                 max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
                 render_mode            = None,

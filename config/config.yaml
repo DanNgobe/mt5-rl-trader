@@ -11,7 +11,7 @@ environment:
 
   # Lot size tiers for the 6 non-HOLD actions: [small, medium, large]
   # BUY/SELL at each tier toggles open/close. Max 6 simultaneous positions.
-  lot_tiers: [0.1, 0.2, 0.5]
+  lot_tiers: [0.01, 0.02, 0.05]
 
   # Episode termination: equity drawdown fraction that triggers margin call.
   # 0.5 = episode ends when equity drops to 50% of initial_balance.
@@ -45,6 +45,11 @@ data:
 # Reward Configuration
 # =====================
 reward:
+  # Reward mode:
+  #   sparse — reward only on close (pnl / initial_balance). Clean signal, hard credit assignment.
+  #   step   — reward per-bar equity delta (equivalent total, but dense). Better gradient flow.
+  reward_mode: sparse
+
   # Per-step cost per lot held. Discourages holding losers and overtrading.
   # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
   holding_cost_per_lot: 0.00001
@@ -64,7 +69,7 @@ reward:
   # - 0.5 = 50% of other positions' profits offset this trade's loss
   # - 1.0 = full offset (closing -10 pip loss is neutral if +10 pips elsewhere)
   # range: [0.0, 1.0] — start at 0.5 for grid strategies
-  portfolio_offset_factor: 0.5
+  portfolio_offset_factor: 0.2
 
 
 # Observation Configuration

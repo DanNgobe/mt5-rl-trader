@@ -20,7 +20,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Forex RL Trader"
 #property version   "3.00"
-#property strict
+#property tester_file "model.onnx"
 
 #include <Trade\Trade.mqh>
 
@@ -28,7 +28,7 @@
 //| Inputs                                                            |
 //+------------------------------------------------------------------+
 input group "=== Model ==="
-input string InpModelPath      = "Models\\model.onnx";
+input string InpModelPath      = "model.onnx";
 
 input group "=== Lot Tiers (must match training config) ==="
 input double InpLot0           = 0.1;    // Tier 0 lot size  (0 to disable)
@@ -54,6 +54,13 @@ int    EMA_FAST        = 8;
 int    EMA_SLOW        = 21;
 int    BOLL_PERIOD     = 20;
 double BOLL_STDDEV     = 2.0;
+
+//+------------------------------------------------------------------+
+//| Logging helper                                                   |
+//+------------------------------------------------------------------+
+void LogInfo(string msg)  { Print("[INFO]  ", msg); }
+void LogWarn(string msg)  { Print("[WARN]  ", msg); }
+void LogError(string msg) { Print("[ERROR] ", msg); }
 
 //+------------------------------------------------------------------+
 //| Globals                                                           |
@@ -118,29 +125,76 @@ int OnInit()
     g_trade.SetTypeFilling(ORDER_FILLING_FOK);
     g_trade.SetAsyncMode(false);
 
-    // Load ONNX model
-    g_onnx_handle = OnnxCreate(InpModelPath, ONNX_DEFAULT);
-    if(g_onnx_handle == INVALID_HANDLE)
+    //--- 1. Check file exists
+    LogInfo("Checking model file: " + InpModelPath);
+    
+    if(!FileIsExist(InpModelPath))
     {
-        Print("ONNX_DEFAULT failed, trying ONNX_COMMON_FOLDER...");
-        g_onnx_handle = OnnxCreate(InpModelPath, ONNX_COMMON_FOLDER);
-    }
-    if(g_onnx_handle == INVALID_HANDLE)
-    {
-        Print("ERROR: OnnxCreate failed (", GetLastError(), ")");
+        LogError("Model file NOT found: " + InpModelPath);
+        LogError("Place the file at: [DataFolder]\\MQL5\\Files\\" + InpModelPath);
+        LogError("Open Data Folder via: File -> Open Data Folder in MT5");
         return INIT_FAILED;
     }
+    
+    LogInfo("✓ Model file found.");
 
+    //--- 2. Load ONNX model (CPU only for compatibility)
+    LogInfo("Attempting OnnxCreate (CPU only)...");
+    g_onnx_handle = OnnxCreate(InpModelPath, ONNX_USE_CPU_ONLY);
+
+    if(g_onnx_handle == INVALID_HANDLE)
+    {
+        int err = GetLastError();
+        LogError("OnnxCreate failed. Error code: " + IntegerToString(err));
+
+        switch(err)
+        {
+            case 5019: LogError("ERR_ONNX_CANNOT_CREATE — file not found, corrupt, or unsupported opset."); break;
+            case 5020: LogError("ERR_ONNX_CANNOT_EXECUTE — runtime execution failure."); break;
+            case 5021: LogError("ERR_ONNX_INCORRECT_INPUT_SHAPE — input shape mismatch."); break;
+            case 5022: LogError("ERR_ONNX_INCORRECT_OUTPUT_SHAPE — output shape mismatch."); break;
+            default:   LogError("Unknown ONNX error."); break;
+        }
+
+        LogError("Possible causes:");
+        LogError("  1. ONNX opset > 17 (MT5 supports up to opset 17)");
+        LogError("  2. File is corrupt or not a valid ONNX file");
+        LogError("  3. Model uses unsupported ops");
+        return INIT_FAILED;
+    }
+    
+    LogInfo("✓ OnnxCreate succeeded. Handle=" + IntegerToString(g_onnx_handle));
+
+    //--- 3. Set input/output shapes
     ulong in_shape[]  = {1, (ulong)g_obs_dim};
     ulong out_shape[] = {1, (ulong)g_n_actions};
-    if(!OnnxSetInputShape(g_onnx_handle, 0, in_shape) ||
-       !OnnxSetOutputShape(g_onnx_handle, 0, out_shape))
+    
+    LogInfo("Setting input shape: [1, " + IntegerToString(g_obs_dim) + "]");
+    if(!OnnxSetInputShape(g_onnx_handle, 0, in_shape))
     {
-        Print("ERROR: OnnxSet*Shape failed (", GetLastError(), ")");
+        LogError("OnnxSetInputShape failed. Error: " + IntegerToString(GetLastError()));
+        OnnxRelease(g_onnx_handle);
+        return INIT_FAILED;
+    }
+    
+    LogInfo("Setting output shape: [1, " + IntegerToString(g_n_actions) + "]");
+    if(!OnnxSetOutputShape(g_onnx_handle, 0, out_shape))
+    {
+        LogError("OnnxSetOutputShape failed. Error: " + IntegerToString(GetLastError()));
         OnnxRelease(g_onnx_handle);
         return INIT_FAILED;
     }
 
+    LogInfo("=== ONNXTrader initialised ===");
+    LogInfo("ModelPath     = " + InpModelPath);
+    LogInfo("InitialBalance= " + DoubleToString(InpInitialBalance, 2));
+    LogInfo("MaxPositions  = " + IntegerToString(g_n_slots));
+    LogInfo("OBS_DIM       = " + IntegerToString(g_obs_dim));
+    LogInfo("Timeframe     = " + IntegerToString(InpTimeframe));
+    LogInfo("Lot tiers     = " + IntegerToString(g_n_tiers));
+    LogInfo("Actions       = " + IntegerToString(g_n_actions));
+    LogInfo("Bars needed   = " + IntegerToString(g_bars_needed));
+    
     Print(StringFormat("ONNXTrader ready. tiers=%d  n_actions=%d  obs_dim=%d",
                        g_n_tiers, g_n_actions, g_obs_dim));
     return INIT_SUCCEEDED;

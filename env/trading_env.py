@@ -24,10 +24,10 @@ Action space — Discrete(1 + 2 * len(lot_tiers))
 Reward
 ------
     On open:      -(spread_paid * spread_cost_scale) / initial_balance
-    On close:     pnl / initial_balance
-    Every step:   -holding_cost_per_lot * sum(lot sizes)  if positions open
+    On close:     pnl / initial_balance  (sparse mode)
+    Every step:   equity_delta / initial_balance  (step mode, replaces close reward)
+                  -holding_cost_per_lot * sum(lot sizes)  if positions open
                   -flat_penalty_per_step                  if flat
-    On terminal:  (final_equity - initial_balance) / initial_balance
 """
 
 import logging
@@ -67,6 +67,7 @@ class TradingEnv(gym.Env):
         holding_cost_per_lot:    float = 0.0001,
         flat_penalty_per_step:   float = 0.0,
         spread_cost_scale:       float = 2.0,
+        reward_mode:             str   = "sparse",  # "sparse" | "step"
         portfolio_offset_factor: float = 0.0,
         max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
@@ -91,6 +92,7 @@ class TradingEnv(gym.Env):
         self.holding_cost_per_lot    = holding_cost_per_lot
         self.flat_penalty_per_step   = flat_penalty_per_step
         self.spread_cost_scale       = spread_cost_scale
+        self.reward_mode             = reward_mode
         self.portfolio_offset_factor = portfolio_offset_factor
         self.max_drawdown_pct        = max_drawdown_pct
         self.episode_length          = episode_length
@@ -126,6 +128,7 @@ class TradingEnv(gym.Env):
 
         self._step:           int               = 0
         self._balance:        float             = initial_balance
+        self._prev_equity:    float             = initial_balance
         self._episode_trades: list[ClosedTrade] = []
         self._start_step:     int               = self._min_step
         self._end_step:       int               = n
@@ -140,6 +143,7 @@ class TradingEnv(gym.Env):
         self._sim.reset()
         self._balance         = self.initial_balance
         self._episode_trades  = []
+        self._prev_equity     = self.initial_balance
 
         if self.random_start and self.episode_length is not None:
             # Pick a random window — ensure enough room for lags at the start
@@ -160,17 +164,16 @@ class TradingEnv(gym.Env):
         return self._observation(), self._info()
 
     def step(self, action: int):
-        action_enum   = Action(int(action))
+        action      = int(action)
         current_price = self._current_price()
 
         reward       = 0.0
         closed_trade = None
 
-        # Update excursions first so MFE/MAE reflect the current bar's price
         self._sim.update_excursions(current_price)
 
-        if action_enum != Action.HOLD:
-            direction, lot_size = self._action_map[action_enum]
+        if action != 0:  # 0 = HOLD
+            direction, lot_size = self._action_map[action]
             # Toggle: close if a matching position exists, otherwise open
             has_match = any(
                 p.direction == direction and abs(p.lot_size - lot_size) < 1e-9
@@ -190,13 +193,18 @@ class TradingEnv(gym.Env):
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
 
-        # Holding cost: scales with total lots held, discourages overtrading
+        # Holding cost / flat penalty — applies in both reward modes
         total_lots = sum(p.lot_size for p in self._sim.positions)
         if total_lots > 0:
             reward -= self.holding_cost_per_lot * total_lots
         else:
-            # Flat penalty: nudges agent to engage when no positions are open
             reward -= self.flat_penalty_per_step
+
+        # Step-mode: add per-bar equity delta on top of any open/close reward
+        if self.reward_mode == "step":
+            reward += (equity - self._prev_equity) / self.initial_balance
+
+        self._prev_equity = equity
 
         self._step += 1
         terminated  = self._is_terminated(equity)
@@ -205,16 +213,8 @@ class TradingEnv(gym.Env):
             close_price = self._current_price()
             for trade in self._sim.close_all(close_price):
                 self._episode_trades.append(trade)
-                # Do NOT add trade.pnl here — the terminal bonus below uses
-                # final balance which already includes these PnLs via cumulative_pnl.
-                # Adding them here would double-count every forced close.
             self._balance = self.initial_balance + self._sim.cumulative_pnl
             equity        = self._balance
-
-        if terminated:
-            # Terminal bonus: overall episode return as a final shaping signal.
-            # Uses only the realised balance (all positions closed above), so no double-count.
-            reward += (self._balance - self.initial_balance) / self.initial_balance
 
         obs  = self._observation()
         info = self._info(closed_trade=closed_trade, equity=equity)
@@ -303,11 +303,16 @@ class TradingEnv(gym.Env):
 
     def _order_reward(self, result: OrderResult) -> float:
         """
-        On open:  charge estimated round-trip spread cost.
-        On close: pnl / initial_balance, optionally offset by other positions' unrealized gains.
+        sparse mode: charge spread on open, return pnl on close.
+        step mode:   charge spread on open only — pnl is captured by the equity delta.
         """
         if result.trade is None:
+            # Open: charge spread cost upfront in both modes
             return -(result.position.spread_paid * self.spread_cost_scale) / self.initial_balance
+
+        if self.reward_mode == "step":
+            # PnL already reflected in equity delta this step — don't double-count
+            return 0.0
 
         trade_pnl = result.trade.pnl / self.initial_balance
 
