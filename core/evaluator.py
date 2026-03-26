@@ -107,14 +107,13 @@ class Evaluator:
                 symbol_spec            = symbol_spec,
                 obs_config             = self.obs_cfg,
                 initial_balance        = initial_balance,
-                max_positions          = self.env_cfg.get("max_positions", 3),
+                lot_tiers              = self.env_cfg.get("lot_tiers", [0.1, 0.2, 0.5]),
                 slippage_prob          = self.env_cfg["slippage_prob"],
                 slippage_range         = tuple(self.env_cfg["slippage_range"]),
-                invalid_action_penalty = self._reward_cfg.get("invalid_action_penalty", 0.001),
                 holding_cost_per_lot   = self._reward_cfg.get("holding_cost_per_lot", 0.0001),
                 flat_penalty_per_step  = self._reward_cfg.get("flat_penalty_per_step", 0.0),
                 spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
-                wrong_lot_penalty      = self._reward_cfg.get("wrong_lot_penalty", 0.0002),
+                portfolio_offset_factor = self._reward_cfg.get("portfolio_offset_factor", 0.0),
                 max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
                 render_mode            = None,
             )
@@ -156,7 +155,7 @@ class Evaluator:
             while not done:
                 action = agent.act(inner_env)
 
-                _, rewards, dones, infos = vec_env.step(action.reshape(1, -1))
+                _, rewards, dones, infos = vec_env.step([action])
                 done = bool(dones[0])
                 info = infos[0]
 

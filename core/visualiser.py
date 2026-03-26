@@ -62,21 +62,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Action index constants (mirrors simulator.Action)
+# Action colour helpers — built dynamically from env.lot_tiers at runtime
 # ---------------------------------------------------------------------------
-_A_HOLD      = 0
-_A_BUY       = 1
-_A_SELL      = 2
-_A_CLOSE_L   = 3  # CLOSE_LONG
-_A_CLOSE_S   = 4  # CLOSE_SHORT
+_BUY_COLOURS  = ["#3ddc97", "#2ab87a", "#1a9460"]   # greens, light → dark
+_SELL_COLOURS = ["#f06474", "#c94455", "#a03040"]   # reds,   light → dark
 
-_ACTION_LABELS = {
-    _A_HOLD:    "HOLD",
-    _A_BUY:     "BUY",
-    _A_SELL:    "SELL",
-    _A_CLOSE_L: "CLOSE_L",
-    _A_CLOSE_S: "CLOSE_S",
-}
+
+def _build_action_colours(lot_tiers: list) -> dict:
+    """Return {action_idx: colour} for a given lot_tiers list."""
+    colours = {0: "#4a5068"}   # HOLD → muted
+    for i in range(len(lot_tiers)):
+        colours[1 + i * 2] = _BUY_COLOURS[min(i, len(_BUY_COLOURS) - 1)]
+        colours[2 + i * 2] = _SELL_COLOURS[min(i, len(_SELL_COLOURS) - 1)]
+    return colours
+
+
+def _build_action_labels(lot_tiers: list) -> dict:
+    """Return {action_idx: label} for a given lot_tiers list."""
+    labels = {0: "HOLD"}
+    for i, lot in enumerate(lot_tiers):
+        labels[1 + i * 2] = f"B{lot:g}"
+        labels[2 + i * 2] = f"S{lot:g}"
+    return labels
 
 # ---------------------------------------------------------------------------
 # Colour palette  (dark terminal aesthetic)
@@ -92,15 +99,6 @@ _AMBER  = "#f5c542"
 _BLUE   = "#5b9cf6"
 _PURPLE = "#a78bfa"
 _WHITE  = "#e8eaf0"
-
-# Colour per action index — used for the strip and its legend
-_ACTION_COLOURS = {
-    _A_HOLD:    _MUTED,
-    _A_BUY:     _GREEN,
-    _A_SELL:    _RED,
-    _A_CLOSE_L: _AMBER,
-    _A_CLOSE_S: _PURPLE,
-}
 
 
 def _import_matplotlib():
@@ -177,8 +175,9 @@ class EpisodeVisualiser:
 
         # Episode-level constants set on first update
         self._initial_balance: float = 0.0
-        self._max_positions:   int   = 0
         self._symbol_name:     str   = ""
+        self._action_colours:  dict  = {}
+        self._action_labels:   dict  = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -208,7 +207,7 @@ class EpisodeVisualiser:
         self,
         env:    "TradingEnv",
         reward: float,
-        action: Optional[np.ndarray] = None,
+        action: Optional[int] = None,
     ) -> None:
         """
         Ingest one step's worth of data and redraw the dashboard.
@@ -219,8 +218,7 @@ class EpisodeVisualiser:
         ----------
         env    : The live TradingEnv (read-only access to its state).
         reward : Scalar reward returned by env.step() this step.
-        action : np.ndarray([direction_idx, lot_tier_idx]) or None.
-                 When None the action is recorded as HOLD (index 0).
+        action : int in [0, n_actions-1] (Discrete) or None (treated as HOLD).
         """
         step  = env._step
         price = env._current_price()
@@ -228,8 +226,8 @@ class EpisodeVisualiser:
         unrealized = env._sim.total_unrealized_pnl(price)
         equity     = env._balance + unrealized
 
-        # Record direction index (0=HOLD if action is None)
-        direction_idx = int(action[0]) if action is not None else _A_HOLD
+        # Record action index (0=HOLD if action is None)
+        direction_idx = int(action) if action is not None else _A_HOLD
 
         self._prices.append(price)
         self._equities.append(equity)
@@ -323,9 +321,10 @@ class EpisodeVisualiser:
         ax_action.set_ylabel("action", color=_MUTED, fontsize=7,
                              rotation=0, labelpad=28, va="center")
 
-        self._initial_balance = env.initial_balance
-        self._max_positions   = env.max_positions
-        self._symbol_name     = env.spec.name
+        self._initial_balance  = env.initial_balance
+        self._symbol_name      = env.spec.name
+        self._action_colours   = _build_action_colours(env.lot_tiers)
+        self._action_labels    = _build_action_labels(env.lot_tiers)
 
         plt.ion()
         plt.show(block=False)
@@ -419,13 +418,13 @@ class EpisodeVisualiser:
             spine.set_edgecolor(_GRID)
 
         if len(vis_steps) > 0:
-            # Build a colour array — one colour per visible step
-            strip_colours = [_ACTION_COLOURS[a] for a in vis_acts]
+            strip_colours = [
+                self._action_colours.get(a, _MUTED) for a in vis_acts
+            ]
 
-            # Draw as thin vertical bars filling the full height [0, 1]
             ax_action.bar(
                 vis_steps,
-                np.ones(len(vis_steps)),      # all height=1
+                np.ones(len(vis_steps)),
                 width  = 1.0,
                 color  = strip_colours,
                 align  = "center",
@@ -435,23 +434,17 @@ class EpisodeVisualiser:
             ax_action.set_xlim(vis_steps[0] - 0.5, vis_steps[-1] + 0.5)
             ax_action.set_ylim(0, 1)
 
-            # Inline legend — coloured squares + labels at the right edge
-            legend_x  = vis_steps[-1] + 0.5 + (vis_steps[-1] - vis_steps[0]) * 0.01
-            items = [
-                (_ACTION_COLOURS[_A_HOLD],    "HOLD"),
-                (_ACTION_COLOURS[_A_BUY],     "BUY"),
-                (_ACTION_COLOURS[_A_SELL],    "SELL"),
-                (_ACTION_COLOURS[_A_CLOSE_L], "CLOSE_L"),
-                (_ACTION_COLOURS[_A_CLOSE_S], "CLOSE_S"),
-            ]
             patches = [
                 self._mpatches.Patch(color=c, label=lbl)
-                for c, lbl in items
+                for lbl, c in [
+                    (self._action_labels[k], self._action_colours[k])
+                    for k in sorted(self._action_colours)
+                ]
             ]
             ax_action.legend(
                 handles   = patches,
                 loc       = "center right",
-                ncol      = 5,
+                ncol      = len(patches),
                 facecolor = _BG,
                 edgecolor = _GRID,
                 labelcolor= _TEXT,
@@ -534,9 +527,9 @@ class EpisodeVisualiser:
         ax_positions.set_title("Open Positions", color=_TEXT, fontsize=9, pad=4)
 
         price     = env._current_price()
-        pos_vec   = env._sim.position_state_vector(price, self._max_positions)
+        pos_vec   = env._sim.position_state_vector(price, env.n_slots)
         slot_size = 5
-        n_slots   = self._max_positions
+        n_slots   = env.n_slots
         matrix    = pos_vec.reshape(n_slots, slot_size)
 
         cmap = self._mcolors.LinearSegmentedColormap.from_list(

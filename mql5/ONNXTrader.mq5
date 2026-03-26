@@ -2,17 +2,24 @@
 //|                                               ONNXTrader.mq5     |
 //|                    Forex RL Trader — MT5 ONNX deployment         |
 //|                                                                  |
-//| Matches Python environment:                                      |
-//|   Action space : MultiDiscrete([5, 3])                          |
-//|     axis-0 direction : 0=HOLD  1=BUY  2=SELL                   |
-//|                        3=CLOSE_LONG  4=CLOSE_SHORT              |
-//|     axis-1 lot_tier  : 0=0.01  1=0.02  2=0.05                  |
-//|   Observation  : [ohlcv_window | position_slots | account]      |
-//|   Preprocessing: log returns on OHLC, z-score on volume         |
-//|   Hedging mode : multiple positions per symbol                  |
+//| Action space : Discrete(1 + 2*N_TIERS)                          |
+//|   0               = HOLD                                        |
+//|   1 + tier*2      = BUY  lot_tiers[tier]  (toggle open/close)  |
+//|   2 + tier*2      = SELL lot_tiers[tier]  (toggle open/close)  |
+//|                                                                  |
+//| Observation (must match Python env exactly):                     |
+//|   price_lags log-returns  [1,2,4,8,24]                          |
+//|   RSI(14) normalised to [-1,1]                                  |
+//|   ATR(14) / close                                               |
+//|   EMA(8)/EMA(21) - 1  clipped [-0.1, 0.1]                      |
+//|   Bollinger %B(20,2) normalised [-1,1]                          |
+//|   Momentum log-returns [5,20,50]                                |
+//|   Session: hour_sin, hour_cos, dow_sin, dow_cos                 |
+//|   Position slots: n_tiers*2 × [dir*lot, upnl_norm, bars_norm]  |
+//|   balance_norm, equity_norm                                     |
 //+------------------------------------------------------------------+
 #property copyright "Forex RL Trader"
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -22,113 +29,120 @@
 //+------------------------------------------------------------------+
 input group "=== Model ==="
 input string InpModelPath      = "Models\\model.onnx";
-input int    InpWindowSize     = 10;       // Must match training
-input int    InpMaxPositions   = 3;        // Must match training
-input int    InpNFeatures      = 5;        // OHLCV = 5
+
+input group "=== Lot Tiers (must match training config) ==="
+input double InpLot0           = 0.1;    // Tier 0 lot size  (0 to disable)
+input double InpLot1           = 0.2;    // Tier 1 lot size  (0 to disable)
+input double InpLot2           = 0.5;    // Tier 2 lot size  (0 to disable)
 
 input group "=== Trading ==="
 input int    InpMagicNumber    = 234567;
 input int    InpMaxSpreadPips  = 30;
-input double InpInitialBalance = 10000.0;  // For account state normalisation
+input double InpInitialBalance = 1000.0; // Must match training initial_balance
 
 input group "=== Timeframe ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;
 
 //+------------------------------------------------------------------+
-//| Constants                                                         |
+//| Constants matching Python preprocessor defaults                  |
 //+------------------------------------------------------------------+
-// Lot tiers — must match LOT_TIERS in simulator.py
-double LOT_TIERS[3] = {0.01, 0.02, 0.05};
-
-// Observation dimension (set in OnInit)
-int OBS_DIM = 0;
+int    PRICE_LAGS[]    = {1, 2, 4, 8, 24};   // must match obs_config.price_lags
+int    MOM_PERIODS[]   = {5, 20, 50};         // must match obs_config.indicators.momentum.periods
+int    RSI_PERIOD      = 14;
+int    ATR_PERIOD      = 14;
+int    EMA_FAST        = 8;
+int    EMA_SLOW        = 21;
+int    BOLL_PERIOD     = 20;
+double BOLL_STDDEV     = 2.0;
 
 //+------------------------------------------------------------------+
 //| Globals                                                           |
 //+------------------------------------------------------------------+
-long    g_onnx_handle = INVALID_HANDLE;
-CTrade  g_trade;
+long   g_onnx_handle = INVALID_HANDLE;
+CTrade g_trade;
 
-double  g_vol_mean = 0.0;
-double  g_vol_std  = 1.0;
+// Built from inputs at OnInit
+double g_lot_tiers[];   // active lot tiers
+int    g_n_tiers  = 0;
+int    g_n_actions = 0;
+int    g_n_slots   = 0;
+int    g_obs_dim   = 0;
 
-//+------------------------------------------------------------------+
-//| Position slot tracking                                            |
-//+------------------------------------------------------------------+
-struct PositionSlot
-{
-    bool   filled;
-    int    direction;    // 1 = LONG, -1 = SHORT
-    double lot_size;
-    double entry_price;
-    ulong  ticket;
-};
+// Bars needed for the longest lag / indicator
+int    g_bars_needed = 0;
 
-PositionSlot g_slots[];
+// Per-slot open tracking: ticket, open_step (bar index at open)
+ulong  g_slot_tickets[];
+int    g_slot_open_bar[];   // absolute bar index when position was opened
+int    g_total_bars = 0;    // incremented each new bar
+
 
 //+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    OBS_DIM = InpWindowSize * InpNFeatures + InpMaxPositions * 5 + 2;
+    // Build lot tiers from inputs (skip zeros)
+    double raw_tiers[3] = {InpLot0, InpLot1, InpLot2};
+    g_n_tiers = 0;
+    for(int i = 0; i < 3; i++)
+        if(raw_tiers[i] > 1e-9) g_n_tiers++;
+
+    if(g_n_tiers == 0) { Print("ERROR: all lot tiers are 0."); return INIT_FAILED; }
+
+    ArrayResize(g_lot_tiers, g_n_tiers);
+    int t = 0;
+    for(int i = 0; i < 3; i++)
+        if(raw_tiers[i] > 1e-9) g_lot_tiers[t++] = raw_tiers[i];
+
+    g_n_actions = 1 + 2 * g_n_tiers;
+    g_n_slots   = g_n_tiers * 2;
+
+    // obs_dim mirrors obs_dim_from_config() in preprocessor.py:
+    //   price_lags + rsi + atr + ema_ratio + bollinger + momentum + session(4) + slots*3 + account(2)
+    int n_price_lags = ArraySize(PRICE_LAGS);
+    int n_mom_periods = ArraySize(MOM_PERIODS);
+    g_obs_dim = n_price_lags + 1 + 1 + 1 + 1 + n_mom_periods + 4 + g_n_slots * 3 + 2;
+
+    // Bars needed: max(price_lags) + max(indicator lookback)
+    // max lag=24, EMA slow warmup ~3*slow=63, Bollinger=20, momentum max=50
+    g_bars_needed = MathMax(PRICE_LAGS[4], MathMax(EMA_SLOW * 3, MOM_PERIODS[2])) + 5;
+
+    ArrayResize(g_slot_tickets,  g_n_slots);
+    ArrayResize(g_slot_open_bar, g_n_slots);
+    ArrayInitialize(g_slot_tickets,  0);
+    ArrayInitialize(g_slot_open_bar, 0);
 
     g_trade.SetExpertMagicNumber(InpMagicNumber);
     g_trade.SetDeviationInPoints(50);
     g_trade.SetTypeFilling(ORDER_FILLING_FOK);
     g_trade.SetAsyncMode(false);
 
-    ArrayResize(g_slots, InpMaxPositions);
-    ClearSlots();
-
-    // OnnxCreate paths are relative to MQL5\Files\ for live trading,
-    // but the Strategy Tester uses a different sandboxed folder.
-    // ONNX_COMMON_FOLDER resolves to the shared Common\Files\ folder,
-    // which works identically in both live and the Strategy Tester.
-    //
-    // Copy model.onnx to:
-    //   [MT5 common data folder]\Files\Models\model.onnx
-    // Find via: MT5 -> File -> Open Common Data Folder
-    string common_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH)
-                         + "\\Files\\" + InpModelPath;
-    Print("Resolved model path: ", common_path);
-    
-    // Try ONNX_DEFAULT first (may avoid CUDA issues), fallback to ONNX_COMMON_FOLDER
+    // Load ONNX model
     g_onnx_handle = OnnxCreate(InpModelPath, ONNX_DEFAULT);
     if(g_onnx_handle == INVALID_HANDLE)
     {
         Print("ONNX_DEFAULT failed, trying ONNX_COMMON_FOLDER...");
         g_onnx_handle = OnnxCreate(InpModelPath, ONNX_COMMON_FOLDER);
     }
-    
     if(g_onnx_handle == INVALID_HANDLE)
     {
-        Print("ERROR: OnnxCreate failed (", GetLastError(),
-              ") - ensure file exists at: ", common_path);
-        Print("FIX: Re-export model.onnx with CPU execution (no CUDA)");
+        Print("ERROR: OnnxCreate failed (", GetLastError(), ")");
         return INIT_FAILED;
     }
 
-    // MT5 ONNX runtime requires explicit shape when batch dim is dynamic
-    ulong in_shape[]  = {1, (ulong)OBS_DIM};
-    // output shape is now [1, 8]: 5 direction logits + 3 lot logits
-    ulong out_shape[] = {1, 8};
-    if(!OnnxSetInputShape(g_onnx_handle, 0, in_shape))
+    ulong in_shape[]  = {1, (ulong)g_obs_dim};
+    ulong out_shape[] = {1, (ulong)g_n_actions};
+    if(!OnnxSetInputShape(g_onnx_handle, 0, in_shape) ||
+       !OnnxSetOutputShape(g_onnx_handle, 0, out_shape))
     {
-        Print("ERROR: OnnxSetInputShape failed (", GetLastError(), ")");
-        OnnxRelease(g_onnx_handle);
-        return INIT_FAILED;
-    }
-    if(!OnnxSetOutputShape(g_onnx_handle, 0, out_shape))
-    {
-        Print("ERROR: OnnxSetOutputShape failed (", GetLastError(), ")");
+        Print("ERROR: OnnxSet*Shape failed (", GetLastError(), ")");
         OnnxRelease(g_onnx_handle);
         return INIT_FAILED;
     }
 
-    Print("ONNX loaded OK. obs_dim=", OBS_DIM, "  output=[1,8]");
-
-    CalibrateVolumeStats();
+    Print(StringFormat("ONNXTrader ready. tiers=%d  n_actions=%d  obs_dim=%d",
+                       g_n_tiers, g_n_actions, g_obs_dim));
     return INIT_SUCCEEDED;
 }
 
@@ -141,170 +155,106 @@ void OnDeinit(const int reason)
         OnnxRelease(g_onnx_handle);
 }
 
+
 //+------------------------------------------------------------------+
-//| OnTick                                                            |
+//| OnTick — act once per closed bar                                 |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // Act only on the first tick of each new closed bar
     static datetime last_bar = 0;
     datetime cur_bar = (datetime)SeriesInfoInteger(_Symbol, InpTimeframe, SERIES_LASTBAR_DATE);
     if(cur_bar == last_bar) return;
     last_bar = cur_bar;
+    g_total_bars++;
 
-    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / point;
-    if(spread > InpMaxSpreadPips)
+    double spread_pts = (SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                       - SymbolInfoDouble(_Symbol, SYMBOL_BID))
+                       / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(spread_pts > InpMaxSpreadPips)
     {
-        Print("Spread too high (", DoubleToString(spread, 1), "). Skipping.");
+        Print("Spread too high (", DoubleToString(spread_pts, 1), "). Skipping.");
         return;
     }
-
-    SyncSlots();
 
     float obs_buf[];
     if(!BuildObservation(obs_buf)) { Print("BuildObservation failed."); return; }
 
     float logits[];
-    if(!RunInference(obs_buf, logits)) { Print("RunInference failed."); return; }
-
-    int    dir_idx  = ArgMax(logits, 0, 5);
-    int    lot_idx  = ArgMax(logits, 5, 3);
-    double lot_size = LOT_TIERS[lot_idx];
-
-    Print(StringFormat(
-        "Action: %s  lot=%.2f  logits=[%.3f,%.3f,%.3f,%.3f,%.3f|%.3f,%.3f,%.3f]",
-        DirectionName(dir_idx), lot_size,
-        logits[0], logits[1], logits[2], logits[3], logits[4],
-        logits[5], logits[6], logits[7]));
-
-    ExecuteAction(dir_idx, lot_size);
-}
-
-//+------------------------------------------------------------------+
-//| Build observation vector                                          |
-//+------------------------------------------------------------------+
-bool BuildObservation(float &obs_buf[])
-{
-    ArrayResize(obs_buf, OBS_DIM);
-    ArrayInitialize(obs_buf, 0.0f);
-
-    int n = InpWindowSize + 2;
-    MqlRates rates[];
-    ArraySetAsSeries(rates, true);
-    if(CopyRates(_Symbol, InpTimeframe, 0, n, rates) < n)
-    {
-        Print("Not enough bars.");
-        return false;
-    }
-
-    // --- 1. OHLCV log returns + z-scored volume (oldest candle first) ---
-    int fill = 0;
-    for(int i = InpWindowSize - 1; i >= 0; i--)
-    {
-        double prev_close = rates[i + 1].close;
-        if(prev_close <= 0.0) prev_close = 1.0;
-
-        obs_buf[fill++] = (float)MathLog(rates[i].open  / prev_close);
-        obs_buf[fill++] = (float)MathLog(rates[i].high  / prev_close);
-        obs_buf[fill++] = (float)MathLog(rates[i].low   / prev_close);
-        obs_buf[fill++] = (float)MathLog(rates[i].close / prev_close);
-
-        double vol_z = (g_vol_std > 1e-8)
-                       ? ((double)rates[i].tick_volume - g_vol_mean) / g_vol_std
-                       : 0.0;
-        obs_buf[fill++] = (float)vol_z;
-    }
-
-    // --- 2. Position slots ---
-    double cur_price = rates[0].close;
-    for(int s = 0; s < InpMaxPositions; s++)
-    {
-        if(!g_slots[s].filled) { fill += 5; continue; }
-
-        double entry       = g_slots[s].entry_price;
-        double lots        = g_slots[s].lot_size;
-        int    dir         = g_slots[s].direction;
-        double price_delta = (entry - cur_price) / cur_price;
-        double pnl         = (cur_price - entry) * (double)dir * lots * 100000.0;
-
-        obs_buf[fill++] = 1.0f;
-        obs_buf[fill++] = (float)dir;
-        obs_buf[fill++] = (float)lots;
-        obs_buf[fill++] = (float)price_delta;
-        obs_buf[fill++] = (float)pnl;
-    }
-
-    // --- 3. Account state ---
-    obs_buf[fill++] = (float)(AccountInfoDouble(ACCOUNT_BALANCE) / InpInitialBalance);
-    obs_buf[fill++] = (float)(AccountInfoDouble(ACCOUNT_EQUITY)  / InpInitialBalance);
-
-    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Run ONNX inference                                                |
-//+------------------------------------------------------------------+
-bool RunInference(const float &obs_buf[], float &logits[])
-{
-    ArrayResize(logits, 8);
-
+    ArrayResize(logits, g_n_actions);
     float obs_copy[];
-    ArrayResize(obs_copy, OBS_DIM);
+    ArrayResize(obs_copy, g_obs_dim);
     ArrayCopy(obs_copy, obs_buf);
 
     if(!OnnxRun(g_onnx_handle, ONNX_DEFAULT, obs_copy, logits))
     {
         Print("OnnxRun failed (", GetLastError(), ")");
-        return false;
+        return;
     }
-    return true;
+
+    // Argmax over all n_actions logits
+    int action = 0;
+    float best = logits[0];
+    for(int i = 1; i < g_n_actions; i++)
+        if(logits[i] > best) { best = logits[i]; action = i; }
+
+    Print(StringFormat("Action=%d  %s", action, ActionName(action)));
+    ExecuteAction(action);
 }
 
+
 //+------------------------------------------------------------------+
-//| Execute action                                                    |
+//| Execute action — toggle semantics                                |
 //+------------------------------------------------------------------+
-void ExecuteAction(int dir_idx, double lot_size)
+void ExecuteAction(int action)
 {
-    int    open_count = CountOpenPositions();
-    double ask        = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double bid        = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if(action == 0) { Print("HOLD."); return; }
 
-    if(dir_idx == 0) { Print("HOLD."); return; }
+    // Decode tier and direction from action index
+    int tier      = (action - 1) / 2;
+    bool is_buy   = ((action - 1) % 2 == 0);
+    double lot    = g_lot_tiers[tier];
+    ENUM_POSITION_TYPE pos_type = is_buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
 
-    if(dir_idx == 1)  // BUY
+    // Toggle: close if matching position exists, else open
+    ulong match_ticket = FindOldestMatchingPosition(pos_type, lot);
+
+    if(match_ticket != 0)
     {
-        if(open_count >= InpMaxPositions)
-            { Print("BUY ignored: cap reached."); return; }
-        if(g_trade.Buy(lot_size, _Symbol, ask, 0, 0, "RL-BUY"))
-            Print(StringFormat("BUY  lot=%.2f  ask=%.5f", lot_size, ask));
+        // Close
+        if(g_trade.PositionClose(match_ticket))
+            Print(StringFormat("CLOSE %s lot=%.2f ticket=%d",
+                               is_buy ? "LONG" : "SHORT", lot, (int)match_ticket));
         else
-            Print("BUY failed: ", g_trade.ResultRetcodeDescription());
-        return;
+            Print("CLOSE failed: ", g_trade.ResultRetcodeDescription());
     }
-
-    if(dir_idx == 2)  // SELL
+    else
     {
-        if(open_count >= InpMaxPositions)
-            { Print("SELL ignored: cap reached."); return; }
-        if(g_trade.Sell(lot_size, _Symbol, bid, 0, 0, "RL-SELL"))
-            Print(StringFormat("SELL lot=%.2f  bid=%.5f", lot_size, bid));
+        // Open
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        bool ok;
+        if(is_buy)
+            ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "RL-BUY");
         else
-            Print("SELL failed: ", g_trade.ResultRetcodeDescription());
-        return;
+            ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "RL-SELL");
+
+        if(ok)
+        {
+            // Record open bar for bars_open tracking
+            ulong new_ticket = g_trade.ResultOrder();
+            RegisterSlot(new_ticket, g_total_bars);
+            Print(StringFormat("OPEN %s lot=%.2f ticket=%d",
+                               is_buy ? "BUY" : "SELL", lot, (int)new_ticket));
+        }
+        else
+            Print("OPEN failed: ", g_trade.ResultRetcodeDescription());
     }
-
-    if(dir_idx == 3)  // CLOSE_LONG
-        CloseOldestMatchingPosition(lot_size, POSITION_TYPE_BUY);
-
-    if(dir_idx == 4)  // CLOSE_SHORT
-        CloseOldestMatchingPosition(lot_size, POSITION_TYPE_SELL);
 }
 
 //+------------------------------------------------------------------+
-//| Close oldest position matching lot_size (FIFO)                   |
+//| Find oldest open position matching type + lot                    |
 //+------------------------------------------------------------------+
-void CloseOldestMatchingPosition(double lot_size, ENUM_POSITION_TYPE pos_type)
+ulong FindOldestMatchingPosition(ENUM_POSITION_TYPE pos_type, double lot)
 {
     ulong    best_ticket = 0;
     datetime best_time   = D'3000.01.01';
@@ -314,113 +264,354 @@ void CloseOldestMatchingPosition(double lot_size, ENUM_POSITION_TYPE pos_type)
     {
         ulong ticket = PositionGetTicket(i);
         if(ticket == 0) continue;
-        if(PositionGetString(POSITION_SYMBOL)              != _Symbol)        continue;
-        if((int)PositionGetInteger(POSITION_MAGIC)         != InpMagicNumber) continue;
-        if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != pos_type) continue;
-        if(MathAbs(PositionGetDouble(POSITION_VOLUME) - lot_size) > 1e-9)     continue;
+        if(PositionGetString(POSITION_SYMBOL)                    != _Symbol)        continue;
+        if((int)PositionGetInteger(POSITION_MAGIC)               != InpMagicNumber) continue;
+        if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != pos_type)       continue;
+        if(MathAbs(PositionGetDouble(POSITION_VOLUME) - lot)     > 1e-9)            continue;
 
         datetime t = (datetime)PositionGetInteger(POSITION_TIME);
         if(t < best_time) { best_time = t; best_ticket = ticket; }
     }
-
-    string type_str = (pos_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
-    if(best_ticket == 0)
-        { Print(StringFormat("CLOSE_%s %.2f: no match.", type_str, lot_size)); return; }
-
-    if(g_trade.PositionClose(best_ticket))
-        Print(StringFormat("CLOSE_%s ticket=%d lot=%.2f", type_str, (int)best_ticket, lot_size));
-    else
-        Print("CLOSE failed: ", g_trade.ResultRetcodeDescription());
+    return best_ticket;
 }
 
 //+------------------------------------------------------------------+
-//| Sync g_slots with live MT5 positions                             |
+//| Slot registry for bars_open tracking                             |
 //+------------------------------------------------------------------+
-void SyncSlots()
+void RegisterSlot(ulong ticket, int open_bar)
 {
-    ClearSlots();
-    int slot = 0, total = PositionsTotal();
+    for(int i = 0; i < g_n_slots; i++)
+    {
+        if(g_slot_tickets[i] == 0)
+        {
+            g_slot_tickets[i]  = ticket;
+            g_slot_open_bar[i] = open_bar;
+            return;
+        }
+    }
+}
 
-    for(int i = 0; i < total && slot < InpMaxPositions; i++)
+int BarsOpenForTicket(ulong ticket)
+{
+    for(int i = 0; i < g_n_slots; i++)
+        if(g_slot_tickets[i] == ticket)
+            return g_total_bars - g_slot_open_bar[i];
+    return 0;
+}
+
+void PruneClosedSlots()
+{
+    for(int i = 0; i < g_n_slots; i++)
+    {
+        if(g_slot_tickets[i] == 0) continue;
+        if(!PositionSelectByTicket(g_slot_tickets[i]))
+        {
+            g_slot_tickets[i]  = 0;
+            g_slot_open_bar[i] = 0;
+        }
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| Build observation vector — mirrors TradingEnv._observation()     |
+//+------------------------------------------------------------------+
+bool BuildObservation(float &obs[])
+{
+    ArrayResize(obs, g_obs_dim);
+    ArrayInitialize(obs, 0.0f);
+
+    int n_bars = g_bars_needed + 10;
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    if(CopyRates(_Symbol, InpTimeframe, 0, n_bars, rates) < n_bars)
+    {
+        Print("Not enough bars (need ", n_bars, ")");
+        return false;
+    }
+
+    // rates[0] = most recent closed bar, rates[k] = k bars ago
+    // close array for indicator computation (oldest first for EMA)
+    double close[];
+    ArrayResize(close, n_bars);
+    for(int i = 0; i < n_bars; i++)
+        close[i] = rates[n_bars - 1 - i].close;   // index 0 = oldest
+
+    int fill = 0;
+
+    // ------------------------------------------------------------------
+    // 1. Sparse lagged close log-returns
+    //    Python: close_log_returns[t - lag]  where t = current step
+    //    In MQL5: rates[lag].close / rates[lag+1].close
+    // ------------------------------------------------------------------
+    int n_lags = ArraySize(PRICE_LAGS);
+    for(int li = 0; li < n_lags; li++)
+    {
+        int lag = PRICE_LAGS[li];
+        double prev = rates[lag].close;
+        double cur  = rates[lag - 1].close;   // one bar newer
+        if(prev <= 0.0) prev = 1.0;
+        obs[fill++] = (float)MathLog(cur / prev);
+    }
+
+    // ------------------------------------------------------------------
+    // 2. RSI(14) normalised to [-1,1]: (rsi/50) - 1
+    // ------------------------------------------------------------------
+    obs[fill++] = (float)ComputeRSI(close, n_bars, RSI_PERIOD);
+
+    // ------------------------------------------------------------------
+    // 3. ATR(14) / close
+    // ------------------------------------------------------------------
+    obs[fill++] = (float)ComputeATR(rates, n_bars, ATR_PERIOD);
+
+    // ------------------------------------------------------------------
+    // 4. EMA(8)/EMA(21) - 1, clipped [-0.1, 0.1]
+    // ------------------------------------------------------------------
+    obs[fill++] = (float)ComputeEMARatio(close, n_bars, EMA_FAST, EMA_SLOW);
+
+    // ------------------------------------------------------------------
+    // 5. Bollinger %B(20,2) normalised to [-1,1]: (pct_b - 0.5)*2
+    // ------------------------------------------------------------------
+    obs[fill++] = (float)ComputeBollinger(close, n_bars, BOLL_PERIOD, BOLL_STDDEV);
+
+    // ------------------------------------------------------------------
+    // 6. Momentum: log(close[t] / close[t-p]) for p in [5,20,50]
+    // ------------------------------------------------------------------
+    int n_mom = ArraySize(MOM_PERIODS);
+    for(int mi = 0; mi < n_mom; mi++)
+    {
+        int p = MOM_PERIODS[mi];
+        double c0 = rates[0].close;
+        double cp = rates[p].close;
+        obs[fill++] = (cp > 0.0) ? (float)MathLog(c0 / cp) : 0.0f;
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Session features: hour_sin, hour_cos, dow_sin, dow_cos
+    // ------------------------------------------------------------------
+    MqlDateTime dt;
+    TimeToStruct(rates[0].time, dt);
+    double hour = (double)dt.hour;
+    double dow  = (double)dt.day_of_week;   // 0=Sun..6=Sat; Python uses 0=Mon..4=Fri
+    obs[fill++] = (float)MathSin(2.0 * M_PI * hour / 24.0);
+    obs[fill++] = (float)MathCos(2.0 * M_PI * hour / 24.0);
+    obs[fill++] = (float)MathSin(2.0 * M_PI * dow  / 5.0);
+    obs[fill++] = (float)MathCos(2.0 * M_PI * dow  / 5.0);
+
+    // ------------------------------------------------------------------
+    // 8. Position slots: [direction*lot_size, upnl_norm, bars_open_norm]
+    //    Sorted by ticket (ascending) to match Python's sorted-by-ticket order.
+    // ------------------------------------------------------------------
+    PruneClosedSlots();
+
+    // Collect live positions for this symbol/magic, sorted by ticket
+    ulong  live_tickets[];
+    double live_dir[];
+    double live_lot[];
+    double live_entry[];
+    int    live_bars[];
+    int    n_live = 0;
+
+    int total = PositionsTotal();
+    for(int i = 0; i < total; i++)
     {
         ulong ticket = PositionGetTicket(i);
         if(ticket == 0) continue;
         if(PositionGetString(POSITION_SYMBOL)      != _Symbol)        continue;
         if((int)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
 
-        g_slots[slot].filled      = true;
-        g_slots[slot].ticket      = ticket;
-        g_slots[slot].lot_size    = PositionGetDouble(POSITION_VOLUME);
-        g_slots[slot].entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
-        g_slots[slot].direction   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
-        slot++;
+        ArrayResize(live_tickets, n_live + 1);
+        ArrayResize(live_dir,     n_live + 1);
+        ArrayResize(live_lot,     n_live + 1);
+        ArrayResize(live_entry,   n_live + 1);
+        ArrayResize(live_bars,    n_live + 1);
+
+        live_tickets[n_live] = ticket;
+        live_dir[n_live]     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1.0 : -1.0;
+        live_lot[n_live]     = PositionGetDouble(POSITION_VOLUME);
+        live_entry[n_live]   = PositionGetDouble(POSITION_PRICE_OPEN);
+        live_bars[n_live]    = BarsOpenForTicket(ticket);
+        n_live++;
     }
-}
 
-//+------------------------------------------------------------------+
-//| Calibrate volume z-score from recent history                     |
-//+------------------------------------------------------------------+
-void CalibrateVolumeStats()
-{
-    long vol_arr[];
-    ArraySetAsSeries(vol_arr, true);
-    int copied = CopyTickVolume(_Symbol, InpTimeframe, 0, 500, vol_arr);
-
-    if(copied < 10)
+    // Sort by ticket ascending (insertion sort — n_live is small)
+    for(int i = 1; i < n_live; i++)
     {
-        Print("Volume calibration: insufficient bars. Using defaults.");
-        g_vol_mean = 0.0; g_vol_std = 1.0;
-        return;
+        ulong kt = live_tickets[i]; double kd = live_dir[i];
+        double kl = live_lot[i]; double ke = live_entry[i]; int kb = live_bars[i];
+        int j = i - 1;
+        while(j >= 0 && live_tickets[j] > kt)
+        {
+            live_tickets[j+1] = live_tickets[j]; live_dir[j+1]  = live_dir[j];
+            live_lot[j+1]     = live_lot[j];     live_entry[j+1] = live_entry[j];
+            live_bars[j+1]    = live_bars[j];    j--;
+        }
+        live_tickets[j+1] = kt; live_dir[j+1] = kd;
+        live_lot[j+1] = kl; live_entry[j+1] = ke; live_bars[j+1] = kb;
     }
 
-    double s = 0.0, sq = 0.0;
-    for(int i = 0; i < copied; i++) s += (double)vol_arr[i];
-    g_vol_mean = s / copied;
-    for(int i = 0; i < copied; i++) sq += MathPow((double)vol_arr[i] - g_vol_mean, 2);
-    g_vol_std = MathSqrt(sq / copied);
-    if(g_vol_std < 1e-8) g_vol_std = 1.0;
+    double cur_price = rates[0].close;
+    int    n_total_bars_approx = g_total_bars > 0 ? g_total_bars : 1;
 
-    Print(StringFormat("Volume: mean=%.1f std=%.1f (%d bars)", g_vol_mean, g_vol_std, copied));
-}
-
-//+------------------------------------------------------------------+
-//| Helpers                                                           |
-//+------------------------------------------------------------------+
-void ClearSlots()
-{
-    for(int i = 0; i < InpMaxPositions; i++)
-        { g_slots[i].filled=false; g_slots[i].direction=0;
-          g_slots[i].lot_size=0; g_slots[i].entry_price=0; g_slots[i].ticket=0; }
-}
-
-int CountOpenPositions()
-{
-    int c = 0, total = PositionsTotal();
-    for(int i = 0; i < total; i++)
+    for(int s = 0; s < g_n_slots; s++)
     {
-        ulong t = PositionGetTicket(i);
-        if(t == 0) continue;
-        if(PositionGetString(POSITION_SYMBOL)      == _Symbol &&
-           (int)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) c++;
+        if(s < n_live)
+        {
+            double dir   = live_dir[s];
+            double lot   = live_lot[s];
+            double entry = live_entry[s];
+            double upnl  = (cur_price - entry) * dir * lot * 100000.0 / InpInitialBalance;
+            double bars_norm = (double)live_bars[s] / (double)n_total_bars_approx;
+
+            obs[fill++] = (float)(dir * lot);
+            obs[fill++] = (float)MathMax(-1.0, MathMin(1.0, upnl));
+            obs[fill++] = (float)bars_norm;
+        }
+        else
+        {
+            obs[fill++] = 0.0f;
+            obs[fill++] = 0.0f;
+            obs[fill++] = 0.0f;
+        }
     }
-    return c;
+
+    // ------------------------------------------------------------------
+    // 9. Account state
+    // ------------------------------------------------------------------
+    obs[fill++] = (float)(AccountInfoDouble(ACCOUNT_BALANCE) / InpInitialBalance);
+    obs[fill++] = (float)(AccountInfoDouble(ACCOUNT_EQUITY)  / InpInitialBalance);
+
+    return true;
 }
 
-int ArgMax(const float &arr[], int start, int length)
+
+//+------------------------------------------------------------------+
+//| Indicator helpers — match Python preprocessor exactly            |
+//+------------------------------------------------------------------+
+
+// EMA of a series (oldest-first array), returns value at last index
+double EMA(const double &series[], int n, int period)
 {
-    int best = start; float bv = arr[start];
-    for(int i = start+1; i < start+length; i++)
-        if(arr[i] > bv) { bv = arr[i]; best = i; }
-    return best - start;
+    double alpha = 2.0 / (period + 1.0);
+    double ema   = series[0];
+    for(int i = 1; i < n; i++)
+        ema = alpha * series[i] + (1.0 - alpha) * ema;
+    return ema;
 }
 
-string DirectionName(int idx)
+// EMA array (oldest-first), fills result[] of length n
+void EMAArray(const double &series[], int n, int period, double &result[])
 {
-    if(idx==0) return "HOLD";
-    if(idx==1) return "BUY";
-    if(idx==2) return "SELL";
-    if(idx==3) return "CLOSE_LONG";
-    if(idx==4) return "CLOSE_SHORT";
-    return "UNKNOWN";
+    ArrayResize(result, n);
+    double alpha = 2.0 / (period + 1.0);
+    result[0] = series[0];
+    for(int i = 1; i < n; i++)
+        result[i] = alpha * series[i] + (1.0 - alpha) * result[i-1];
+}
+
+// RSI(period) normalised to [-1,1]: (rsi/50)-1
+// close[] is oldest-first, length n; returns value at last bar
+double ComputeRSI(const double &close[], int n, int period)
+{
+    if(n < period + 1) return 0.0;
+
+    // Wilder EMA of gains/losses
+    double alpha = 1.0 / (double)period;
+    double avg_gain = 0.0, avg_loss = 0.0;
+
+    // Seed with first period
+    for(int i = 1; i <= period; i++)
+    {
+        double d = close[i] - close[i-1];
+        if(d > 0) avg_gain += d; else avg_loss -= d;
+    }
+    avg_gain /= period;
+    avg_loss /= period;
+
+    for(int i = period + 1; i < n; i++)
+    {
+        double d = close[i] - close[i-1];
+        double g = (d > 0) ? d : 0.0;
+        double l = (d < 0) ? -d : 0.0;
+        avg_gain = alpha * g + (1.0 - alpha) * avg_gain;
+        avg_loss = alpha * l + (1.0 - alpha) * avg_loss;
+    }
+
+    double rs  = (avg_loss > 1e-10) ? avg_gain / avg_loss : 100.0;
+    double rsi = 100.0 - 100.0 / (1.0 + rs);
+    return rsi / 50.0 - 1.0;
+}
+
+// ATR(period) / close — rates[] is newest-first (as returned by CopyRates)
+double ComputeATR(const MqlRates &rates[], int n, int period)
+{
+    if(n < period + 1) return 0.0;
+
+    double alpha = 1.0 / (double)period;
+    // Seed
+    double atr = 0.0;
+    for(int i = n - 2; i >= n - 1 - period; i--)
+    {
+        double tr = MathMax(rates[i].high - rates[i].low,
+                   MathMax(MathAbs(rates[i].high - rates[i+1].close),
+                           MathAbs(rates[i].low  - rates[i+1].close)));
+        atr += tr;
+    }
+    atr /= period;
+
+    // Wilder smooth to most recent bar
+    for(int i = n - 1 - period - 1; i >= 0; i--)
+    {
+        double tr = MathMax(rates[i].high - rates[i].low,
+                   MathMax(MathAbs(rates[i].high - rates[i+1].close),
+                           MathAbs(rates[i].low  - rates[i+1].close)));
+        atr = alpha * tr + (1.0 - alpha) * atr;
+    }
+
+    double c = rates[0].close;
+    return (c > 0.0) ? atr / c : 0.0;
+}
+
+// EMA(fast)/EMA(slow) - 1, clipped [-0.1, 0.1]
+double ComputeEMARatio(const double &close[], int n, int fast, int slow)
+{
+    double ema_f = EMA(close, n, fast);
+    double ema_s = EMA(close, n, slow);
+    if(ema_s <= 0.0) return 0.0;
+    double ratio = ema_f / ema_s - 1.0;
+    return MathMax(-0.1, MathMin(0.1, ratio));
+}
+
+// Bollinger %B(period, std_dev) normalised to [-1,1]: (pct_b - 0.5)*2
+// close[] oldest-first; returns value at last bar
+double ComputeBollinger(const double &close[], int n, int period, double std_dev)
+{
+    if(n < period) return 0.0;
+
+    // Rolling mean and std of last `period` values
+    double sum = 0.0, sq = 0.0;
+    for(int i = n - period; i < n; i++) sum += close[i];
+    double mean = sum / period;
+    for(int i = n - period; i < n; i++) sq += MathPow(close[i] - mean, 2);
+    double std = MathSqrt(sq / period);
+
+    double upper = mean + std_dev * std;
+    double lower = mean - std_dev * std;
+    double band  = upper - lower;
+    double pct_b = (band > 1e-10) ? (close[n-1] - lower) / band : 0.5;
+    double norm  = (pct_b - 0.5) * 2.0;
+    return MathMax(-1.5, MathMin(1.5, norm));
+}
+
+//+------------------------------------------------------------------+
+//| Utility                                                           |
+//+------------------------------------------------------------------+
+string ActionName(int action)
+{
+    if(action == 0) return "HOLD";
+    int tier    = (action - 1) / 2;
+    bool is_buy = ((action - 1) % 2 == 0);
+    return StringFormat("%s lot=%.2f (tier %d)",
+                        is_buy ? "BUY" : "SELL", g_lot_tiers[tier], tier);
 }
 //+------------------------------------------------------------------+

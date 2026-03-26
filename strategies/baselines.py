@@ -4,21 +4,14 @@ strategies/baselines.py
 Concrete baseline strategies for benchmarking the RL agent.
 
 RandomStrategy
-    Samples direction and lot tier uniformly at random each step.
-    Sets the floor — the RL agent must beat this comfortably.
+    Samples uniformly from env.n_actions each step.
 
 MACrossStrategy
     Classic moving-average crossover on raw close prices.
     - fast MA crosses above slow MA → BUY  (open long)
     - fast MA crosses below slow MA → SELL (open short)
-    - Opposite crossover while a position is open → CLOSE then flip
+    - Opposite crossover while a position is open → toggle-close then flip
     - No signal → HOLD
-
-    Operates on env.raw_close directly (un-normalised prices).
-    No SciPy / TA-Lib dependency — pure numpy rolling means.
-
-Both strategies use lot_tier=0 (0.01 lots) throughout to keep
-position sizing neutral and isolate the signal quality.
 """
 
 from __future__ import annotations
@@ -45,10 +38,8 @@ class RandomStrategy(BaseStrategy):
     Parameters
     ----------
     seed : int or None
-        Random seed for reproducibility.  None = non-deterministic.
     lot_tier : int
-        Fixed lot tier index (0=0.01, 1=0.02, 2=0.05).
-        Default 0 keeps position sizes small and neutral.
+        Fixed lot tier index used for MA cross (ignored for random).
     """
 
     name = "random"
@@ -58,16 +49,10 @@ class RandomStrategy(BaseStrategy):
         self._lot_tier = lot_tier
 
     def reset(self) -> None:
-        # RNG state is NOT reset between episodes so successive episodes
-        # are independent draws, not the same random sequence.
         pass
 
-    def act(self, env: "TradingEnv") -> np.ndarray:
-        # Note: random actions will frequently be invalid (open at cap, close
-        # with no position, etc.) and hit the invalid_action_penalty. This is
-        # intentional — it's the absolute floor baseline, not a fair strategy.
-        direction = int(self._rng.integers(0, 5))   # 0-4 inclusive
-        return np.array([direction, self._lot_tier], dtype=np.int32)
+    def act(self, env: "TradingEnv") -> int:
+        return int(self._rng.integers(0, env.n_actions))
 
 
 # ---------------------------------------------------------------------------
@@ -78,18 +63,6 @@ class MACrossStrategy(BaseStrategy):
     """
     Simple dual moving-average crossover strategy.
 
-    Signal logic
-    ------------
-    - Requires at least `slow` bars of price history before acting.
-      Returns HOLD during the warm-up period.
-    - Golden cross (fast > slow, previously fast <= slow) → enter LONG:
-        * If SHORT position open: CLOSE it first (next step will BUY).
-        * If no position: BUY.
-    - Death cross (fast < slow, previously fast >= slow) → enter SHORT:
-        * If LONG position open: CLOSE it first (next step will SELL).
-        * If no position: SELL.
-    - No crossover: HOLD (let existing position run).
-
     Parameters
     ----------
     fast : int
@@ -97,88 +70,67 @@ class MACrossStrategy(BaseStrategy):
     slow : int
         Slow MA period in bars (default 50).
     lot_tier : int
-        Fixed lot tier index (0=0.01, 1=0.02, 2=0.05).
+        Tier index into env.lot_tiers used for new positions (default 0).
     """
 
     name = "ma_cross"
 
-    def __init__(
-        self,
-        fast:     int = 10,
-        slow:     int = 50,
-        lot_tier: int = 0,
-    ):
+    def __init__(self, fast: int = 10, slow: int = 50, lot_tier: int = 0):
         if fast >= slow:
-            raise ValueError(
-                f"fast ({fast}) must be shorter than slow ({slow})."
-            )
+            raise ValueError(f"fast ({fast}) must be shorter than slow ({slow}).")
         self._fast     = fast
         self._slow     = slow
         self._lot_tier = lot_tier
-
-        # Crossover state from the previous step
         self._prev_fast_above: Optional[bool] = None
-
-        # Deferred action: when we need to close before flipping,
-        # we emit CLOSE this step and store the flip for next step.
-        self._pending_action: Optional[np.ndarray] = None
+        self._pending_action:  Optional[int]  = None
 
     def reset(self) -> None:
         self._prev_fast_above = None
         self._pending_action  = None
 
-    def act(self, env: "TradingEnv") -> np.ndarray:
-        # Emit deferred flip action from previous step (close-then-flip)
+    def act(self, env: "TradingEnv") -> int:
         if self._pending_action is not None:
-            action                = self._pending_action
-            self._pending_action  = None
+            action               = self._pending_action
+            self._pending_action = None
             return action
 
         prices = self._prices_up_to_now(env)
-
-        # Not enough history yet
         if len(prices) < self._slow:
             return self._hold()
 
-        fast_ma = float(prices[-self._fast:].mean())
-        slow_ma = float(prices[-self._slow:].mean())
-
+        fast_ma    = float(prices[-self._fast:].mean())
+        slow_ma    = float(prices[-self._slow:].mean())
         fast_above = fast_ma > slow_ma
 
-        # First bar after warm-up — just record state, no signal yet
         if self._prev_fast_above is None:
             self._prev_fast_above = fast_above
             return self._hold()
 
         crossover_up   = fast_above and not self._prev_fast_above
         crossover_down = not fast_above and self._prev_fast_above
-
         self._prev_fast_above = fast_above
 
-        n_positions = env._sim.n_positions
-        positions   = env._sim.positions
+        positions = env._sim.positions
 
         if crossover_up:
             short_pos = next((p for p in positions if p.direction == Direction.SHORT), None)
             if short_pos is not None:
-                # Match the actual lot tier of the open position to avoid invalid close
-                from core.simulator import LOT_TIERS
-                close_tier = min(range(len(LOT_TIERS)),
-                                 key=lambda i: abs(LOT_TIERS[i] - short_pos.lot_size))
+                # Find tier index in env.lot_tiers matching this position's lot
+                close_tier = min(range(len(env.lot_tiers)),
+                                 key=lambda i: abs(env.lot_tiers[i] - short_pos.lot_size))
                 self._pending_action = self._buy(self._lot_tier)
-                return self._close_short(close_tier)
-            elif n_positions == 0:
+                return self._sell(close_tier)   # toggle-close the short
+            elif env._sim.n_positions == 0:
                 return self._buy(self._lot_tier)
 
         elif crossover_down:
             long_pos = next((p for p in positions if p.direction == Direction.LONG), None)
             if long_pos is not None:
-                from core.simulator import LOT_TIERS
-                close_tier = min(range(len(LOT_TIERS)),
-                                 key=lambda i: abs(LOT_TIERS[i] - long_pos.lot_size))
+                close_tier = min(range(len(env.lot_tiers)),
+                                 key=lambda i: abs(env.lot_tiers[i] - long_pos.lot_size))
                 self._pending_action = self._sell(self._lot_tier)
-                return self._close_long(close_tier)
-            elif n_positions == 0:
+                return self._buy(close_tier)    # toggle-close the long
+            elif env._sim.n_positions == 0:
                 return self._sell(self._lot_tier)
 
         return self._hold()

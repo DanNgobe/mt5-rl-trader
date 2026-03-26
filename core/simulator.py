@@ -21,15 +21,8 @@ class Direction(IntEnum):
     SHORT = -1
 
 
-class Action(IntEnum):
-    HOLD        = 0
-    BUY         = 1
-    SELL        = 2
-    CLOSE_LONG  = 3
-    CLOSE_SHORT = 4
-
-
-LOT_TIERS: list[float] = [0.01, 0.02, 0.05]
+# Default lot tiers — overridden at runtime via config.yaml (environment.lot_tiers)
+LOT_TIERS: list[float] = [0.1, 0.2, 0.5]
 
 
 @dataclass
@@ -148,13 +141,13 @@ class TradeSimulator:
     def __init__(
         self,
         symbol_spec:    SymbolSpec,
-        max_positions:  int   = 3,
+        lot_tiers:      list[float] = None,
         slippage_prob:  float = 0.3,
         slippage_range: tuple[float, float] = (0.00001, 0.0005),
         rng:            Optional[np.random.Generator] = None,
     ):
         self.spec           = symbol_spec
-        self.max_positions  = max_positions
+        self.lot_tiers      = lot_tiers if lot_tiers is not None else list(LOT_TIERS)
         self.slippage_prob  = slippage_prob
         self.slippage_range = slippage_range
         self._rng           = rng if rng is not None else np.random.default_rng()
@@ -215,15 +208,7 @@ class TradeSimulator:
 
     def open_position(self, market_price: float, direction: Direction, lot_size: float,
                       open_step: int = 0) -> OrderResult:
-        """
-        Open a new position at market price.
-
-        Returns OrderResult(invalid=True) if at max_positions cap.
-        """
-        if self.n_positions >= self.max_positions:
-            logger.debug("Cannot open: at max_positions cap (%d).", self.max_positions)
-            return OrderResult(success=False, invalid=True, reason="max_positions_reached")
-
+        """Open a new position at market price."""
         fill, spread_paid, slippage = self._fill_open(market_price, direction)
         pos = Position(
             ticket      = self._next_ticket,
@@ -242,24 +227,18 @@ class TradeSimulator:
 
     def close_position(self, market_price: float, direction: Direction, lot_size: float) -> OrderResult:
         """
-        Close the oldest open position matching both direction and lot_size.
+        Close the oldest open position matching direction and lot_size.
 
         Returns OrderResult(invalid=True) if no matching position exists.
         """
-        # Check if any position exists in this direction at all
-        has_direction = any(p.direction == direction for p in self._positions)
-        if not has_direction:
-            logger.debug("CLOSE_%s: no position in this direction.", direction.name)
-            return OrderResult(success=False, invalid=True, reason="no_position_in_direction")
-
         target = next(
             (p for p in self._positions
              if p.direction == direction and abs(p.lot_size - lot_size) < 1e-9),
             None,
         )
         if target is None:
-            logger.debug("CLOSE_%s %.2f lots: direction exists but lot tier mismatch.", direction.name, lot_size)
-            return OrderResult(success=False, invalid=True, reason="no_matching_lot")
+            logger.debug("CLOSE_%s %.2f lots: no matching position.", direction.name, lot_size)
+            return OrderResult(success=False, invalid=True, reason="no_matching_position")
 
         fill, spread_paid, slippage = self._fill_close(market_price, target.direction)
 
@@ -298,46 +277,26 @@ class TradeSimulator:
     def total_unrealized_pnl(self, current_price: float) -> float:
         return sum(p.unrealized_pnl(current_price, self.spec.contract_size) for p in self._positions)
 
-    def position_state_vector(self, current_price: float, max_positions: int) -> np.ndarray:
+    def position_state_vector(self, current_price: float, n_slots: int) -> np.ndarray:
         """
-        Return a flat array of position slot states for visualization.
-        
-        Shape: (max_positions * 5,) — each 5-element slice represents one slot:
-          [filled, direction, lot_size, price_diff_from_entry, unrealized_pnl]
-        
-        filled: 1 if occupied, 0 if empty
-        direction: 1 (LONG), -1 (SHORT), or 0 (empty)
-        lot_size: size of the position, or 0 if empty
-        price_diff_from_entry: (current - entry) for LONG, (entry - current) for SHORT
-        unrealized_pnl: trade PnL at current price (normalized by 100 for display)
+        Return a flat array of position slot states.
+
+        Shape: (n_slots * 5,) — each 5-element slice:
+          [filled, direction, lot_size, price_diff_from_entry, unrealized_pnl_norm]
+        n_slots = len(lot_tiers) * 2 (one slot per possible open position).
         """
-        # Pad positions to max_positions slots
-        vec = np.zeros(max_positions * 5, dtype=np.float32)
-        
-        for i, pos in enumerate(self._positions[:max_positions]):
+        vec = np.zeros(n_slots * 5, dtype=np.float32)
+        for i, pos in enumerate(self._positions[:n_slots]):
             base_idx = i * 5
-            
-            # Slot filled flag
             vec[base_idx + 0] = 1.0
-            
-            # Direction: 1.0 for LONG, -1.0 for SHORT
             vec[base_idx + 1] = float(pos.direction)
-            
-            # Lot size
             vec[base_idx + 2] = pos.lot_size
-            
-            # Price difference from entry (favourable = positive for display)
             if pos.direction == Direction.LONG:
                 vec[base_idx + 3] = current_price - pos.entry_price
-            else:  # SHORT
+            else:
                 vec[base_idx + 3] = pos.entry_price - current_price
-            
-            # Unrealized PnL (normalized for heatmap display, capped to [-1, 1])
             upnl = pos.unrealized_pnl(current_price, self.spec.contract_size)
-            # Normalize by dividing by a scale factor (e.g., 500 for typical trades)
-            normalized_upnl = np.clip(upnl / 500.0, -1.0, 1.0)
-            vec[base_idx + 4] = normalized_upnl
-        
+            vec[base_idx + 4] = np.clip(upnl / 500.0, -1.0, 1.0)
         return vec
 
     def reset(self) -> None:

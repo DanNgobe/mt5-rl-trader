@@ -33,7 +33,7 @@ def evaluate(
         from env.preprocessor import obs_dim_from_config
         obs_dim = obs_dim_from_config(
             evaluator.obs_cfg,
-            evaluator.env_cfg.get("max_positions", 3),
+            len(evaluator.env_cfg.get("lot_tiers", [0.1, 0.2, 0.5])) * 2,
         )
         export_onnx(agent.model, onnx_path, obs_dim)
 

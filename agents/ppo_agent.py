@@ -47,7 +47,7 @@ class PPOAgent(BaseAgent):
     # BaseAgent interface
     # ------------------------------------------------------------------
 
-    def act(self, env: "TradingEnv") -> np.ndarray:
+    def act(self, env: "TradingEnv") -> int:
         if self.model is None:
             raise RuntimeError("PPOAgent has no model loaded. Call load() first.")
         obs          = env._observation()
@@ -57,7 +57,7 @@ class PPOAgent(BaseAgent):
             action_masks=action_masks[np.newaxis, :],
             deterministic=True,
         )
-        return np.asarray(action[0], dtype=np.int32)
+        return int(action[0])
 
     def load(self, path: str) -> None:
         log.info("Loading MaskablePPO model from %s", path)

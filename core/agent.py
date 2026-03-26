@@ -7,17 +7,14 @@ works identically for all of them.
 
 Interface contract
 ------------------
-    act(env)  — given a live TradingEnv, return a (2,) int32 action array
-                 [direction_idx, lot_tier_idx]  (same as MultiDiscrete([4,3]))
+    act(env)  — return a scalar int action in [0, env.n_actions-1]:
+                   0               = HOLD
+                   1 + tier*2      = BUY  lot_tiers[tier]
+                   2 + tier*2      = SELL lot_tiers[tier]
 
     reset()   — called at the start of every episode; default is a no-op
     load()    — optional; strategies don't need it
     save()    — optional; strategies don't need it
-
-Why act(env) instead of act(obs)?
-    Strategies need raw (un-normalised) prices for indicator calculations.
-    Passing the full env gives them that without breaking the RL agent,
-    which simply calls env._observation() internally.
 """
 
 from __future__ import annotations
@@ -32,29 +29,18 @@ if TYPE_CHECKING:
 
 
 class BaseAgent(ABC):
-    """
-    Common interface for RL agents and hand-coded strategies.
+    """Common interface for RL agents and hand-coded strategies."""
 
-    Subclasses must implement act().  All other methods have sensible
-    defaults so strategies don't need boilerplate load/save stubs.
-    """
-
-    #: Human-readable name used in logs and saved results.
     name: str = "base_agent"
 
     def reset(self) -> None:
         """Called at the start of every episode.  Override if stateful."""
 
     @abstractmethod
-    def act(self, env: "TradingEnv") -> np.ndarray:
+    def act(self, env: "TradingEnv") -> int:
         """
-        Decide an action given the current environment state.
-
-        Args:
-            env: Live TradingEnv instance (read-only — never call step/reset).
-
         Returns:
-            np.ndarray of shape (2,) dtype int32: [direction_idx, lot_tier_idx]
+            int in [0, env.n_actions-1] — Discrete action index.
         """
 
     def load(self, path: str) -> None:
@@ -64,25 +50,19 @@ class BaseAgent(ABC):
         """Persist agent state to disk.  No-op by default."""
 
     # ------------------------------------------------------------------
-    # Shared action helpers — available to all subclasses
+    # Shared action helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _hold() -> np.ndarray:
-        return np.array([0, 0], dtype=np.int32)
+    def _hold() -> int:
+        return 0
 
     @staticmethod
-    def _buy(lot_tier: int = 0) -> np.ndarray:
-        return np.array([1, lot_tier], dtype=np.int32)
+    def _buy(lot_tier: int = 0) -> int:
+        # lot_tier 0→action 1, 1→action 3, 2→action 5
+        return 1 + lot_tier * 2
 
     @staticmethod
-    def _sell(lot_tier: int = 0) -> np.ndarray:
-        return np.array([2, lot_tier], dtype=np.int32)
-
-    @staticmethod
-    def _close_long(lot_tier: int = 0) -> np.ndarray:
-        return np.array([3, lot_tier], dtype=np.int32)
-
-    @staticmethod
-    def _close_short(lot_tier: int = 0) -> np.ndarray:
-        return np.array([4, lot_tier], dtype=np.int32)
+    def _sell(lot_tier: int = 0) -> int:
+        # lot_tier 0→action 2, 1→action 4, 2→action 6
+        return 2 + lot_tier * 2

@@ -169,10 +169,12 @@ def compute_session_features(dt_index: pd.DatetimeIndex,
 # Observation dimension calculator
 # ---------------------------------------------------------------------------
 
-def obs_dim_from_config(obs_cfg: dict, max_positions: int) -> int:
+def obs_dim_from_config(obs_cfg: dict, n_slots: int) -> int:
     """
-    Compute the flat observation vector length from obs_config + max_positions.
-    Mirrors exactly what build_obs_arrays + TradingEnv._observation produce.
+    Compute the flat observation vector length.
+
+    n_slots = len(lot_tiers) * 2  — passed in from TradingEnv so the
+    preprocessor stays decoupled from the action space config.
     """
     ind = obs_cfg.get("indicators", {})
     dim = 0
@@ -184,8 +186,8 @@ def obs_dim_from_config(obs_cfg: dict, max_positions: int) -> int:
     if ind.get("momentum", {}).get("enabled", True):
         dim += len(ind["momentum"].get("periods", [5, 20, 50]))
     if ind.get("session",  {}).get("enabled", True):  dim += 4
-    dim += max_positions * 3   # [direction*lot_size, upnl_norm, bars_open_norm] per slot
-    dim += 2                   # balance_norm, equity_norm
+    dim += n_slots * 3   # [direction*lot_size, upnl_norm, bars_open_norm] per slot
+    dim += 2             # balance_norm, equity_norm
     return dim
 
 

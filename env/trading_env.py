@@ -10,23 +10,21 @@ Observation vector (all features configurable via obs_config)
     [bollinger]                          Bollinger %B normalised [-1,1]
     [momentum_5, momentum_20, momentum_50]
     [hour_sin, hour_cos, dow_sin, dow_cos]
-    [position_slots]                     max_positions × 3
+    [position_slots]   len(lot_tiers)*2 slots × 3 features each
     [balance_norm, equity_norm]
 
-    Observation dimension is computed dynamically from obs_config +
-    max_positions — changing either in config.yaml automatically resizes
-    the space.
+Action space — Discrete(1 + 2 * len(lot_tiers))
+-------------------------------------------------
+    0               = HOLD
+    1 + tier*2      = BUY  lot_tiers[tier]   (toggle: open or close)
+    2 + tier*2      = SELL lot_tiers[tier]   (toggle: open or close)
 
-Action space — MultiDiscrete([5, 3])
--------------------------------------
-    axis-0  direction : 0=HOLD  1=BUY  2=SELL  3=CLOSE_LONG  4=CLOSE_SHORT
-    axis-1  lot_tier  : 0=0.01  1=0.02  2=0.05
+    All actions are always valid — no penalties.
 
 Reward
 ------
     On open:      -(spread_paid * spread_cost_scale) / initial_balance
     On close:     pnl / initial_balance
-    On invalid:   -invalid_action_penalty  (flat)
     Every step:   -holding_cost_per_lot * sum(lot sizes)  if positions open
                   -flat_penalty_per_step                  if flat
     On terminal:  (final_equity - initial_balance) / initial_balance
@@ -40,7 +38,6 @@ import numpy as np
 from gymnasium import spaces
 
 from core.simulator import (
-    Action,
     ClosedTrade,
     Direction,
     LOT_TIERS,
@@ -64,14 +61,12 @@ class TradingEnv(gym.Env):
         symbol_spec:             SymbolSpec,
         obs_config:              dict,
         initial_balance:         float = 10_000.0,
-        max_positions:           int   = 3,
+        lot_tiers:               list  = None,
         slippage_prob:           float = 0.3,
         slippage_range:          tuple[float, float] = (0.00001, 0.0005),
-        invalid_action_penalty:  float = 0.001,
         holding_cost_per_lot:    float = 0.0001,
         flat_penalty_per_step:   float = 0.0,
         spread_cost_scale:       float = 2.0,
-        wrong_lot_penalty:       float = 0.0002,
         portfolio_offset_factor: float = 0.0,
         max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
@@ -89,34 +84,42 @@ class TradingEnv(gym.Env):
         self.spec            = symbol_spec
         self.obs_config      = obs_config
         self.initial_balance = initial_balance
-        self.max_positions   = max_positions
+        self.lot_tiers       = list(lot_tiers) if lot_tiers is not None else list(LOT_TIERS)
         self.render_mode     = render_mode
         self.n_samples       = n
 
-        self.invalid_action_penalty = invalid_action_penalty
-        self.holding_cost_per_lot   = holding_cost_per_lot
-        self.flat_penalty_per_step  = flat_penalty_per_step
-        self.spread_cost_scale      = spread_cost_scale
-        self.wrong_lot_penalty      = wrong_lot_penalty
+        self.holding_cost_per_lot    = holding_cost_per_lot
+        self.flat_penalty_per_step   = flat_penalty_per_step
+        self.spread_cost_scale       = spread_cost_scale
         self.portfolio_offset_factor = portfolio_offset_factor
-        self.max_drawdown_pct       = max_drawdown_pct
-        self.episode_length         = episode_length
-        self.random_start           = random_start
+        self.max_drawdown_pct        = max_drawdown_pct
+        self.episode_length          = episode_length
+        self.random_start            = random_start
 
-        # Sparse lag indices (bars back from current step)
+        # Action map: action_idx → (Direction, lot_size)
+        # action 0 = HOLD, then BUY/SELL pairs per tier:
+        #   1 + tier*2 = BUY lot_tiers[tier]
+        #   2 + tier*2 = SELL lot_tiers[tier]
+        self._action_map: dict[int, tuple[Direction, float]] = {}
+        for i, lot in enumerate(self.lot_tiers):
+            self._action_map[1 + i * 2] = (Direction.LONG,  lot)
+            self._action_map[2 + i * 2] = (Direction.SHORT, lot)
+
+        self.n_actions = 1 + 2 * len(self.lot_tiers)   # HOLD + BUY/SELL per tier
+        self.n_slots   = len(self.lot_tiers) * 2        # max simultaneous positions
+
         self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
-        # Minimum step needed so all lags are valid
         self._min_step = max(self._price_lags)
 
-        obs_dim = obs_dim_from_config(obs_config, max_positions)
+        obs_dim = obs_dim_from_config(obs_config, self.n_slots)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
-        self.action_space = spaces.MultiDiscrete([5, 3])
+        self.action_space = spaces.Discrete(self.n_actions)
 
         self._sim = TradeSimulator(
             symbol_spec    = symbol_spec,
-            max_positions  = max_positions,
+            lot_tiers      = self.lot_tiers,
             slippage_prob  = slippage_prob,
             slippage_range = slippage_range,
         )
@@ -156,40 +159,32 @@ class TradingEnv(gym.Env):
         self._step = self._start_step
         return self._observation(), self._info()
 
-    def step(self, action: np.ndarray):
-        direction_idx, lot_idx = int(action[0]), int(action[1])
-        direction_action       = Action(direction_idx)
-        lot_size               = LOT_TIERS[lot_idx]
-        current_price          = self._current_price()
+    def step(self, action: int):
+        action_enum   = Action(int(action))
+        current_price = self._current_price()
 
         reward       = 0.0
         closed_trade = None
 
         # Update excursions first so MFE/MAE reflect the current bar's price
-        # before any close (including terminal close_all) reads them.
         self._sim.update_excursions(current_price)
 
-        if direction_action == Action.BUY:
-            result = self._sim.open_position(current_price, Direction.LONG, lot_size, self._step)
-            reward = self._order_reward(result)
-
-        elif direction_action == Action.SELL:
-            result = self._sim.open_position(current_price, Direction.SHORT, lot_size, self._step)
-            reward = self._order_reward(result)
-
-        elif direction_action == Action.CLOSE_LONG:
-            result = self._sim.close_position(current_price, Direction.LONG, lot_size)
-            reward = self._order_reward(result)
-            if result.trade is not None:
-                closed_trade = result.trade
-                self._episode_trades.append(closed_trade)
-
-        elif direction_action == Action.CLOSE_SHORT:
-            result = self._sim.close_position(current_price, Direction.SHORT, lot_size)
-            reward = self._order_reward(result)
-            if result.trade is not None:
-                closed_trade = result.trade
-                self._episode_trades.append(closed_trade)
+        if action_enum != Action.HOLD:
+            direction, lot_size = self._action_map[action_enum]
+            # Toggle: close if a matching position exists, otherwise open
+            has_match = any(
+                p.direction == direction and abs(p.lot_size - lot_size) < 1e-9
+                for p in self._sim.positions
+            )
+            if has_match:
+                result = self._sim.close_position(current_price, direction, lot_size)
+                reward = self._order_reward(result)
+                if result.trade is not None:
+                    closed_trade = result.trade
+                    self._episode_trades.append(closed_trade)
+            else:
+                result = self._sim.open_position(current_price, direction, lot_size, self._step)
+                reward = self._order_reward(result)
 
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
@@ -247,46 +242,8 @@ class TradingEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def action_masks(self) -> np.ndarray:
-        """
-        Return a boolean mask over the MultiDiscrete([5, 3]) action space.
-        
-        MaskablePPO expects shape (n_actions_per_dim,) = (5+3,) = (8,).
-        Structure: [dir_mask (5 elements), lot_mask (3 elements)]
-          - dir_mask[i]: whether direction i is valid
-          - lot_mask[j]: whether lot tier j is valid
-        
-        Masking rules for direction:
-          - HOLD (0): always valid
-          - BUY (1): valid only if not at max_positions
-          - SELL (2): valid only if not at max_positions
-          - CLOSE_LONG (3): valid only if long position(s) exist
-          - CLOSE_SHORT (4): valid only if short position(s) exist
-        
-        For lot tiers: we allow all tiers universally, since MaskablePPO
-        doesn't natively support joint masking (lot validity depends on direction).
-        The environment will reject invalid lot-direction combinations via
-        the reward penalty system.
-        """
-        positions   = self._sim.positions
-        at_cap      = self._sim.n_positions >= self.max_positions
-        has_long    = any(p.direction == Direction.LONG for p in positions)
-        has_short   = any(p.direction == Direction.SHORT for p in positions)
-
-        # Mask for 5 direction choices
-        dir_mask = np.array([
-            True,           # Action.HOLD: always valid
-            not at_cap,     # Action.BUY: valid if not at capacity
-            not at_cap,     # Action.SELL: valid if not at capacity
-            has_long,       # Action.CLOSE_LONG: valid if longs exist
-            has_short,      # Action.CLOSE_SHORT: valid if shorts exist
-        ], dtype=bool)
-
-        # Mask for 3 lot tier choices (all always valid at this level)
-        # Individual lot matching for CLOSE actions is handled via reward penalties
-        lot_mask = np.ones(3, dtype=bool)
-
-        # Concatenate direction and lot masks
-        return np.concatenate([dir_mask, lot_mask])
+        """All actions always valid — toggle logic handles open vs close."""
+        return np.ones(self.n_actions, dtype=bool)
 
     # ------------------------------------------------------------------
     # Episode stats
@@ -344,46 +301,25 @@ class TradingEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
 
-    def _order_reward(self, result: OrderResult, direction: Optional[Direction] = None) -> float:
+    def _order_reward(self, result: OrderResult) -> float:
         """
-        On open:    charge estimated round-trip spread cost.
-        On close:   pnl / initial_balance, optionally offset by other positions' unrealized gains.
-        Invalid:
-          - no_matching_lot (right direction, wrong lot tier): small penalty.
-          - everything else (no position in direction, open at cap): full penalty.
-        
-        Portfolio offset (grid/martingale):
-          When closing a losing trade, reward is adjusted by other positions' unrealized PnL.
-          Formula: close_reward = trade_pnl + (portfolio_offset_factor * other_unrealized_pnl)
+        On open:  charge estimated round-trip spread cost.
+        On close: pnl / initial_balance, optionally offset by other positions' unrealized gains.
         """
-        if result.invalid:
-            if result.reason == "no_matching_lot":
-                # Agent tried to close the right direction but picked the wrong lot tier.
-                # Intent is correct — apply a small nudge, not a full deterrent.
-                return -self.wrong_lot_penalty
-            return -self.invalid_action_penalty
-
         if result.trade is None:
-            # Charge spread cost upfront — scale configurable (default round-trip = 2.0)
             return -(result.position.spread_paid * self.spread_cost_scale) / self.initial_balance
 
-        # BASE CLOSE REWARD
         trade_pnl = result.trade.pnl / self.initial_balance
-        
-        # PORTFOLIO-AWARE ADJUSTMENT (grid/martingale support)
+
         if self.portfolio_offset_factor > 0 and trade_pnl < 0:
-            # Trade is losing — offset with other positions' unrealized gains
             current_price = self._current_price()
             other_unrealized = sum(
                 p.unrealized_pnl(current_price, self.spec.contract_size)
                 for p in self._sim.positions
             ) / self.initial_balance
-            
-            # Only apply offset if portfolio (excluding this trade) is net positive
             if other_unrealized > 0:
-                offset_reward = trade_pnl + (self.portfolio_offset_factor * other_unrealized)
-                return offset_reward
-        
+                return trade_pnl + (self.portfolio_offset_factor * other_unrealized)
+
         return trade_pnl
 
     # ------------------------------------------------------------------
@@ -421,12 +357,11 @@ class TradingEnv(gym.Env):
         if ind.get("session",   {}).get("enabled", True):
             parts.extend(self.obs_arrays["session"][t].tolist())
 
-        # 3. Position slots: [direction*lot_size, unrealized_pnl_norm, bars_open_norm] × max_positions
-        # Sorted by ticket to guarantee stable slot assignment — closing a position never
-        # shifts remaining positions into different slots, preventing spurious state changes.
+        # 3. Position slots: [direction*lot_size, unrealized_pnl_norm, bars_open_norm] × n_slots
+        # Sorted by ticket to guarantee stable slot assignment.
         price = self._current_price()
         sorted_positions = sorted(self._sim.positions, key=lambda p: p.ticket)
-        for i in range(self.max_positions):
+        for i in range(self.n_slots):
             if i < len(sorted_positions):
                 pos = sorted_positions[i]
                 bars_open = max(0, self._step - pos.open_step)
