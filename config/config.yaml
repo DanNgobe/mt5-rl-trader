@@ -48,11 +48,11 @@ reward:
   # Reward mode:
   #   sparse — reward only on close (pnl / initial_balance). Clean signal, hard credit assignment.
   #   step   — reward per-bar equity delta (equivalent total, but dense). Better gradient flow.
-  reward_mode: sparse
+  reward_mode: step
 
   # Per-step cost per lot held. Discourages holding losers and overtrading.
   # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
-  holding_cost_per_lot: 0.00001
+  holding_cost_per_lot: 0.0001
 
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
@@ -64,12 +64,24 @@ reward:
   spread_cost_scale: 2.0
 
   # Portfolio-aware close rewards.
-  # When closing a losing trade, offset the loss with other positions' unrealized gains.
+  # When closing all positions via CLOSE_ALL, offset any loss with the portfolio's unrealized gains.
+  # This factor is ONLY applied when the agent executes the CLOSE_ALL action.
   # - 0.0 = trade isolation (current behavior, no offset)
-  # - 0.5 = 50% of other positions' profits offset this trade's loss
-  # - 1.0 = full offset (closing -10 pip loss is neutral if +10 pips elsewhere)
+  # - 0.5 = 50% of the portfolio's net profits offset each losing trade's loss
+  # - 1.0 = full offset
   # range: [0.0, 1.0] — start at 0.5 for grid strategies
-  portfolio_offset_factor: 0.2
+  portfolio_offset_factor: 0
+
+  # Explicit penalty applied on the exact step a margin call (max_drawdown_pct breached) occurs.
+  # Teaches the agent to fear bankruptcy significantly more than a normal losing trade.
+  # range: [1.0, 10.0] — 5.0 is standard. Set to 0.0 to disable.
+  drawdown_penalty: 5.0
+
+  # Differential Sharpe Ratio / Variance Penalty (Step mode only).
+  # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
+  # Encourages slow, stable growth over highly chaotic/volatile equity curves.
+  # range: [0.1, 2.0] — start at 0.5. Set to 0.0 to disable.
+  volatility_penalty_multiplier: 0.5
 
 
 # Observation Configuration

@@ -353,3 +353,13 @@ MIT
 3. Make your changes
 4. Run tests: `python -m pytest tests/ -v`
 5. Submit a pull request
+
+---
+
+## Future Improvements
+
+### 1. Dynamic Position Sizing (The Compound Sizing Dilemma)
+Currently, the environment uses fixed absolute volume values for actions (e.g., `lot_tiers = [0.1, 0.2, 0.5]`). Now that the reward structure scales by `current_equity`, an agent will experience shrinking percentage rewards for the same successful trade as its balance grows. To keep the mathematical incentives stationary during compounding, future iterations should update `lot_tiers` to represent **percentages of current equity/margin** rather than fixed lots (e.g., 1%, 2%, 5% risk per trade).
+
+### 2. Time-To-Live for Positions (Sparse-Mode Open Loophole)
+In `sparse` reward mode, holding costs are applied strictly upon closing the position. This creates a potential loophole where the RL agent realizes that closing a deep negative trade locks in an accumulated penalty, causing it to effectively refuse to close trades and hold them indefinitely until the episode naturally ends. Adding a hard limit on position lifetimes (e.g. `max_hold_bars = 500`) that triggers a forceful closure would remove this loophole and enforce better credit assignment without spamming dense negative rewards.

@@ -63,6 +63,8 @@ def _make_env_fn(
             spread_cost_scale      = reward_cfg.get("spread_cost_scale", 2.0),
             reward_mode            = reward_cfg.get("reward_mode", "sparse"),
             portfolio_offset_factor = reward_cfg.get("portfolio_offset_factor", 0.0),
+            volatility_penalty_multiplier = reward_cfg.get("volatility_penalty_multiplier", 0.0),
+            drawdown_penalty       = reward_cfg.get("drawdown_penalty", 5.0),
             max_drawdown_pct       = env_config.get("max_drawdown_pct", 0.5),
             episode_length         = env_config.get("episode_length"),
             random_start           = env_config.get("random_start", False),

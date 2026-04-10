@@ -115,6 +115,8 @@ class Evaluator:
                 spread_cost_scale      = self._reward_cfg.get("spread_cost_scale", 2.0),
                 reward_mode            = self._reward_cfg.get("reward_mode", "sparse"),
                 portfolio_offset_factor = self._reward_cfg.get("portfolio_offset_factor", 0.0),
+                volatility_penalty_multiplier = self._reward_cfg.get("volatility_penalty_multiplier", 0.0),
+                drawdown_penalty       = self._reward_cfg.get("drawdown_penalty", 5.0),
                 max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
                 render_mode            = None,
             )
@@ -122,8 +124,8 @@ class Evaluator:
                 env = ActionMasker(env, lambda e: e.action_masks())
             return env
 
-        vec_env   = DummyVecEnv([_make_env])
-        inner_env: TradingEnv = vec_env.envs[0].env if _HAS_MASKER else vec_env.envs[0]
+        eval_env = _make_env()
+        inner_env: TradingEnv = eval_env.env if _HAS_MASKER else eval_env
 
         # ------------------------------------------------------------------
         # Optional visualiser
@@ -144,7 +146,7 @@ class Evaluator:
         episode_summaries: list[dict]       = []
 
         for ep in range(n_episodes):
-            vec_env.reset()
+            eval_env.reset()
             agent.reset()
 
             if vis is not None:
@@ -156,15 +158,14 @@ class Evaluator:
             while not done:
                 action = agent.act(inner_env)
 
-                _, rewards, dones, infos = vec_env.step([action])
-                done = bool(dones[0])
-                info = infos[0]
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                done = terminated or truncated
 
                 price  = inner_env._current_price()
                 equity = inner_env._balance + inner_env._sim.total_unrealized_pnl(price)
 
                 if vis is not None:
-                    vis.update(inner_env, float(rewards[0]), action=action)
+                    vis.update(inner_env, float(reward), action=action)
 
                 equity_curve.append(equity)
 
@@ -205,7 +206,7 @@ class Evaluator:
 
         if vis is not None:
             vis.close()
-        vec_env.close()
+        eval_env.close()
 
         # ------------------------------------------------------------------
         # Metrics + output

@@ -13,11 +13,12 @@ Observation vector (all features configurable via obs_config)
     [position_slots]   len(lot_tiers)*2 slots × 3 features each
     [balance_norm, equity_norm]
 
-Action space — Discrete(1 + 2 * len(lot_tiers))
+Action space — Discrete(2 + 2 * len(lot_tiers))
 -------------------------------------------------
     0               = HOLD
     1 + tier*2      = BUY  lot_tiers[tier]   (toggle: open or close)
     2 + tier*2      = SELL lot_tiers[tier]   (toggle: open or close)
+    n_actions - 1   = CLOSE_ALL
 
     All actions are always valid — no penalties.
 
@@ -69,6 +70,8 @@ class TradingEnv(gym.Env):
         spread_cost_scale:       float = 2.0,
         reward_mode:             str   = "sparse",  # "sparse" | "step"
         portfolio_offset_factor: float = 0.0,
+        volatility_penalty_multiplier: float = 0.0,  # 0.0 to disable variance penalty
+        drawdown_penalty:        float = 5.0,
         max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
         random_start:            bool  = False,
@@ -94,6 +97,8 @@ class TradingEnv(gym.Env):
         self.spread_cost_scale       = spread_cost_scale
         self.reward_mode             = reward_mode
         self.portfolio_offset_factor = portfolio_offset_factor
+        self.volatility_penalty_multiplier = volatility_penalty_multiplier
+        self.drawdown_penalty        = drawdown_penalty
         self.max_drawdown_pct        = max_drawdown_pct
         self.episode_length          = episode_length
         self.random_start            = random_start
@@ -107,7 +112,7 @@ class TradingEnv(gym.Env):
             self._action_map[1 + i * 2] = (Direction.LONG,  lot)
             self._action_map[2 + i * 2] = (Direction.SHORT, lot)
 
-        self.n_actions = 1 + 2 * len(self.lot_tiers)   # HOLD + BUY/SELL per tier
+        self.n_actions = 2 + 2 * len(self.lot_tiers)   # HOLD + BUY/SELL per tier + CLOSE_ALL
         self.n_slots   = len(self.lot_tiers) * 2        # max simultaneous positions
 
         self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
@@ -130,6 +135,7 @@ class TradingEnv(gym.Env):
         self._balance:        float             = initial_balance
         self._prev_equity:    float             = initial_balance
         self._episode_trades: list[ClosedTrade] = []
+        self._returns_buffer: list[float]       = []
         self._start_step:     int               = self._min_step
         self._end_step:       int               = n
 
@@ -143,6 +149,7 @@ class TradingEnv(gym.Env):
         self._sim.reset()
         self._balance         = self.initial_balance
         self._episode_trades  = []
+        self._returns_buffer  = []
         self._prev_equity     = self.initial_balance
 
         if self.random_start and self.episode_length is not None:
@@ -173,36 +180,71 @@ class TradingEnv(gym.Env):
         self._sim.update_excursions(current_price)
 
         if action != 0:  # 0 = HOLD
-            direction, lot_size = self._action_map[action]
-            # Toggle: close if a matching position exists, otherwise open
-            has_match = any(
-                p.direction == direction and abs(p.lot_size - lot_size) < 1e-9
-                for p in self._sim.positions
-            )
-            if has_match:
-                result = self._sim.close_position(current_price, direction, lot_size)
-                reward = self._order_reward(result)
-                if result.trade is not None:
-                    closed_trade = result.trade
-                    self._episode_trades.append(closed_trade)
+            if action == self.n_actions - 1:  # CLOSE_ALL
+                if self._sim.has_positions:
+                    norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
+                    offset_pool = sum(
+                        p.unrealized_pnl(current_price, self.spec.contract_size)
+                        for p in self._sim.positions
+                    ) / norm_denom
+
+                    for pos in list(self._sim.positions):
+                        result = self._sim.close_position(current_price, pos.direction, pos.lot_size)
+                        if result.trade is not None:
+                            self._episode_trades.append(result.trade)
+                            closed_trade = result.trade
+                        reward += self._order_reward(result, is_close_all=True, offset_pool=offset_pool)
             else:
-                result = self._sim.open_position(current_price, direction, lot_size, self._step)
-                reward = self._order_reward(result)
+                direction, lot_size = self._action_map[action]
+                # Toggle: close if a matching position exists, otherwise open
+                has_match = any(
+                    p.direction == direction and abs(p.lot_size - lot_size) < 1e-9
+                    for p in self._sim.positions
+                )
+                if has_match:
+                    result = self._sim.close_position(current_price, direction, lot_size)
+                    reward = self._order_reward(result, is_close_all=False)
+                    if result.trade is not None:
+                        closed_trade = result.trade
+                        self._episode_trades.append(closed_trade)
+                else:
+                    result = self._sim.open_position(current_price, direction, lot_size, self._step)
+                    reward = self._order_reward(result, is_close_all=False)
 
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
 
-        # Holding cost / flat penalty — applies in both reward modes
+        # Cost application based on reward mode
         total_lots = sum(p.lot_size for p in self._sim.positions)
-        if total_lots > 0:
-            reward -= self.holding_cost_per_lot * total_lots
-        else:
-            reward -= self.flat_penalty_per_step
-
-        # Step-mode: add per-bar equity delta on top of any open/close reward
         if self.reward_mode == "step":
-            reward += (equity - self._prev_equity) / self.initial_balance
+            if total_lots > 0:
+                reward -= self.holding_cost_per_lot * total_lots
+            else:
+                reward -= self.flat_penalty_per_step
+
+            # Step-mode: add per-bar equity delta on top of any open/close reward
+            norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
+            step_return = (equity - self._prev_equity) / norm_denom
+            reward += step_return
+            
+            # Differential Sharpe Ratio / Variance Penalty
+            if self.volatility_penalty_multiplier > 0:
+                self._returns_buffer.append(step_return)
+                if len(self._returns_buffer) > 50:
+                    self._returns_buffer.pop(0)
+                if len(self._returns_buffer) >= 2:
+                    volatility = float(np.std(self._returns_buffer))
+                    reward -= (volatility * self.volatility_penalty_multiplier)
+        else:
+            # Sparse mode: holding cost is delayed until close, but flat penalty applies if 0 positions
+            if total_lots == 0:
+                reward -= self.flat_penalty_per_step
+
+        # Apply Terminal Bankrupt Penalty
+        bankrupt = equity < self.initial_balance * (1.0 - self.max_drawdown_pct)
+        if bankrupt:
+            reward -= self.drawdown_penalty  # Massive explicit penalty on margin call
 
         self._prev_equity = equity
 
@@ -301,29 +343,39 @@ class TradingEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
 
-    def _order_reward(self, result: OrderResult) -> float:
+    def _order_reward(self, result: OrderResult, is_close_all: bool = False, offset_pool: float = 0.0) -> float:
         """
         sparse mode: charge spread on open, return pnl on close.
         step mode:   charge spread on open only — pnl is captured by the equity delta.
         """
+        norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
+
         if result.trade is None:
-            # Open: charge spread cost upfront in both modes
-            return -(result.position.spread_paid * self.spread_cost_scale) / self.initial_balance
+            # Open: charge spread cost
+            actual_spread_norm = result.position.spread_paid / norm_denom
+            if self.reward_mode == "step":
+                # In step mode, spread is already reflected in equity drop.
+                # Only explicitly penalize the extra scale
+                extra_scale = max(0.0, self.spread_cost_scale - 1.0)
+                return -(actual_spread_norm * extra_scale)
+            else:
+                return -(actual_spread_norm * self.spread_cost_scale)
 
         if self.reward_mode == "step":
             # PnL already reflected in equity delta this step — don't double-count
             return 0.0
 
-        trade_pnl = result.trade.pnl / self.initial_balance
+        trade_pnl = result.trade.pnl / norm_denom
 
-        if self.portfolio_offset_factor > 0 and trade_pnl < 0:
-            current_price = self._current_price()
-            other_unrealized = sum(
-                p.unrealized_pnl(current_price, self.spec.contract_size)
-                for p in self._sim.positions
-            ) / self.initial_balance
-            if other_unrealized > 0:
-                return trade_pnl + (self.portfolio_offset_factor * other_unrealized)
+        # Apply holding costs if sparse
+        bars_open = max(0, self._step - result.trade.open_step)
+        holding_cost = (self.holding_cost_per_lot * result.trade.lot_size * bars_open)
+        trade_pnl -= holding_cost
+
+        if is_close_all and self.portfolio_offset_factor > 0 and trade_pnl < 0:
+            if offset_pool > 0:
+                trade_pnl += (self.portfolio_offset_factor * offset_pool)
+                trade_pnl = min(0.0, trade_pnl)  # Exploit fix: cap at 0
 
         return trade_pnl
 

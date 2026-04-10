@@ -160,6 +160,7 @@ class EpisodeVisualiser:
         self._buy_markers:   list[tuple[int, float]] = []
         self._sell_markers:  list[tuple[int, float]] = []
         self._close_markers: list[tuple[int, float]] = []
+        self._closed_trade_lines: list[tuple[int, float, int, float, str]] = []
 
         # Internal tracking state
         self._last_trade_count: int = 0
@@ -193,6 +194,7 @@ class EpisodeVisualiser:
         self._buy_markers.clear()
         self._sell_markers.clear()
         self._close_markers.clear()
+        self._closed_trade_lines.clear()
         self._last_trade_count = 0
         self._last_n_positions = 0
 
@@ -238,8 +240,11 @@ class EpisodeVisualiser:
         # Detect newly closed trade
         n_trades = len(env._episode_trades)
         if n_trades > self._last_trade_count:
-            latest = env._episode_trades[-1]
-            self._close_markers.append((step, float(latest.exit_price)))
+            for trade in env._episode_trades[self._last_trade_count:]:
+                self._close_markers.append((step, float(trade.exit_price)))
+                self._closed_trade_lines.append(
+                    (trade.open_step, float(trade.entry_price), step, float(trade.exit_price), trade.direction.name)
+                )
             self._last_trade_count = n_trades
 
         # Detect newly opened position
@@ -360,7 +365,17 @@ class EpisodeVisualiser:
         )
         ax_price.plot(vis_steps, vis_prices, color=_BLUE,
                       linewidth=1.0, alpha=0.9, zorder=2)
+        if len(vis_steps) > 0:
+            ax_price.set_xlim(vis_steps[0] - 0.5, vis_steps[-1] + 0.5)
         ax_price.grid(True, color=_GRID, linewidth=0.5, alpha=0.6)
+
+        for open_step, entry_price, close_step, exit_price, direction in self._closed_trade_lines:
+            if close_step >= win_origin:
+                color = _RED if direction == "SHORT" else _BLUE
+                ax_price.plot(
+                    [open_step, close_step], [entry_price, exit_price],
+                    color=color, linewidth=1.5, linestyle=":", alpha=0.8, zorder=4
+                )
 
         for s, p in self._buy_markers:
             if s >= win_origin:

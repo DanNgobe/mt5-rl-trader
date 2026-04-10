@@ -2,10 +2,11 @@
 //|                                               ONNXTrader.mq5     |
 //|                    Forex RL Trader — MT5 ONNX deployment         |
 //|                                                                  |
-//| Action space : Discrete(1 + 2*N_TIERS)                          |
+//| Action space : Discrete(2 + 2*N_TIERS)                          |
 //|   0               = HOLD                                        |
 //|   1 + tier*2      = BUY  lot_tiers[tier]  (toggle open/close)  |
 //|   2 + tier*2      = SELL lot_tiers[tier]  (toggle open/close)  |
+//|   max_action      = CLOSE_ALL                                   |
 //|                                                                  |
 //| Observation (must match Python env exactly):                     |
 //|   price_lags log-returns  [1,2,4,8,24]                          |
@@ -102,7 +103,7 @@ int OnInit()
     for(int i = 0; i < 3; i++)
         if(raw_tiers[i] > 1e-9) g_lot_tiers[t++] = raw_tiers[i];
 
-    g_n_actions = 1 + 2 * g_n_tiers;
+    g_n_actions = 2 + 2 * g_n_tiers;
     g_n_slots   = g_n_tiers * 2;
 
     // obs_dim mirrors obs_dim_from_config() in preprocessor.py:
@@ -262,6 +263,26 @@ void OnTick()
 void ExecuteAction(int action)
 {
     if(action == 0) { Print("HOLD."); return; }
+    
+    // CLOSE_ALL
+    if(action == g_n_actions - 1)
+    {
+        Print("CLOSE_ALL: closing all open positions.");
+        int total = PositionsTotal();
+        for(int i = total - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL)      != _Symbol)        continue;
+            if((int)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+            
+            if(g_trade.PositionClose(ticket))
+                Print(StringFormat("CLOSE_ALL ticket=%d", (int)ticket));
+            else
+                Print("CLOSE_ALL failed on ticket ", ticket, ": ", g_trade.ResultRetcodeDescription());
+        }
+        return;
+    }
 
     // Decode tier and direction from action index
     int tier      = (action - 1) / 2;
@@ -663,6 +684,7 @@ double ComputeBollinger(const double &close[], int n, int period, double std_dev
 string ActionName(int action)
 {
     if(action == 0) return "HOLD";
+    if(action == g_n_actions - 1) return "CLOSE_ALL";
     int tier    = (action - 1) / 2;
     bool is_buy = ((action - 1) % 2 == 0);
     return StringFormat("%s lot=%.2f (tier %d)",

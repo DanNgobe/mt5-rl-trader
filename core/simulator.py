@@ -93,6 +93,7 @@ class ClosedTrade:
     slippage:    float
     mfe_pnl:     float  # P&L at the most favourable price reached
     mae_pnl:     float  # P&L at the most adverse price reached
+    open_step:   int    = 0
     forced:      bool   = False  # True when closed by episode termination, not agent choice
 
     def to_dict(self) -> dict:
@@ -107,6 +108,7 @@ class ClosedTrade:
             "slippage":    self.slippage,
             "mfe_pnl":     self.mfe_pnl,
             "mae_pnl":     self.mae_pnl,
+            "open_step":   self.open_step,
             "forced":      self.forced,
         }
 
@@ -257,6 +259,7 @@ class TradeSimulator:
             slippage    = target.slippage    + slippage,
             mfe_pnl     = mfe_pnl,
             mae_pnl     = mae_pnl,
+            open_step   = target.open_step,
         )
         self._positions.remove(target)
         self._closed_trades.append(trade)
