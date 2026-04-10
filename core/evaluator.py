@@ -190,7 +190,8 @@ class Evaluator:
 
                     if vis is not None:
                         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        save_path = Path(results_dir) / f"vis_{agent.name}_ep{ep+1}_{ts}.png"
+                        safe_name = str(agent.name).replace(":", "_").replace("\\", "_").replace("/", "_").replace(".zip", "")
+                        save_path = Path(results_dir) / f"vis_{safe_name}_ep{ep+1}_{ts}.png"
                         save_path.parent.mkdir(parents=True, exist_ok=True)
                         vis.save(str(save_path))
 

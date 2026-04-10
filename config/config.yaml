@@ -51,17 +51,17 @@ reward:
   reward_mode: step
 
   # Per-step cost per lot held. Discourages holding losers and overtrading.
-  # range: [0.00005, 0.0005] — scale up if agent holds too long, down if it exits too early
-  holding_cost_per_lot: 0.0001
+  # range: [0.000005, 0.00005] — scale up if agent holds too long, down if it exits too early
+  holding_cost_per_lot: 0.00001
 
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
   # range: [0.0, 0.0000005]
   flat_penalty_per_step: 0.0
 
-  # Spread cost multiplier on open. 2.0 = full round-trip charged upfront.
-  # range: [1.0, 2.0] — 1.0 charges only the open leg, 2.0 is most conservative
-  spread_cost_scale: 2.0
+  # Spread cost multiplier on open. 1.0 = full round-trip charged upfront.
+  # range: [1.0, 2.0] — 1.0 charges exactly the spread, 2.0 is most conservative
+  spread_cost_scale: 1.0
 
   # Portfolio-aware close rewards.
   # When closing all positions via CLOSE_ALL, offset any loss with the portfolio's unrealized gains.
@@ -80,7 +80,7 @@ reward:
   # Differential Sharpe Ratio / Variance Penalty (Step mode only).
   # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
   # Encourages slow, stable growth over highly chaotic/volatile equity curves.
-  # range: [0.1, 2.0] — start at 0.5. Set to 0.0 to disable.
+  # range: [0.1, 2.0] — disabled for now to allow basic convergence.
   volatility_penalty_multiplier: 0.5
 
 

@@ -422,8 +422,8 @@ class TradingEnv(gym.Env):
             if i < len(sorted_positions):
                 pos = sorted_positions[i]
                 bars_open = max(0, self._step - pos.open_step)
-                parts.append(float(pos.direction) * pos.lot_size)
-                parts.append(pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance)
+                parts.append((float(pos.direction) * pos.lot_size) * 10.0)
+                parts.append((pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance) * 10.0)
                 parts.append(bars_open / self.n_samples)
             else:
                 parts.extend([0.0, 0.0, 0.0])
@@ -431,8 +431,8 @@ class TradingEnv(gym.Env):
         # 4. Account state
         unrealized = self._sim.total_unrealized_pnl(price)
         equity     = self._balance + unrealized
-        parts.append(self._balance / self.initial_balance)
-        parts.append(equity        / self.initial_balance)
+        parts.append((self._balance - self.initial_balance) / self.initial_balance * 10.0)
+        parts.append((equity - self.initial_balance) / self.initial_balance * 10.0)
 
         return np.array(parts, dtype=np.float32)
 

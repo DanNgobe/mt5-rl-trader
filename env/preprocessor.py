@@ -29,16 +29,16 @@ OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 # ---------------------------------------------------------------------------
 
 def log_returns(prices: np.ndarray) -> np.ndarray:
-    """Log returns for a 1-D or 2-D price array. First row = 0."""
+    """Log returns for a 1-D or 2-D price array. First row = 0. Scaled x100 for NN."""
     prices = np.asarray(prices, dtype=np.float64)
     if prices.ndim == 1:
         result     = np.empty_like(prices)
         result[0]  = 0.0
-        result[1:] = np.log(prices[1:] / prices[:-1])
+        result[1:] = np.log(prices[1:] / prices[:-1]) * 100.0
         return result.astype(np.float32)
     result        = np.empty_like(prices)
     result[0, :]  = 0.0
-    result[1:, :] = np.log(prices[1:, :] / prices[:-1, :])
+    result[1:, :] = np.log(prices[1:, :] / prices[:-1, :]) * 100.0
     return result.astype(np.float32)
 
 
@@ -95,7 +95,7 @@ def compute_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                     np.abs(low  - prev_close)))
 
     atr = pd.Series(tr).ewm(com=period - 1, adjust=False).mean().to_numpy()
-    return (atr / np.where(close > 0, close, 1.0)).astype(np.float32)
+    return ((atr / np.where(close > 0, close, 1.0)) * 100.0).astype(np.float32)
 
 
 def compute_ema_ratio(close: np.ndarray, fast: int = 8, slow: int = 21) -> np.ndarray:
@@ -141,7 +141,7 @@ def compute_momentum(close: np.ndarray, periods: list[int]) -> np.ndarray:
     result = np.zeros((n, len(periods)), dtype=np.float32)
     for col, p in enumerate(periods):
         if p < n:
-            result[p:, col] = np.log(close[p:] / close[:-p]).astype(np.float32)
+            result[p:, col] = (np.log(close[p:] / close[:-p]) * 100.0).astype(np.float32)
     return result
 
 
