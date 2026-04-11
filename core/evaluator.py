@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 from core.agent import BaseAgent
 from core.config import load_config, load_symbol_spec
@@ -124,8 +124,14 @@ class Evaluator:
                 env = ActionMasker(env, lambda e: e.action_masks())
             return env
 
-        eval_env = _make_env()
-        inner_env: TradingEnv = eval_env.env if _HAS_MASKER else eval_env
+        inner_env_unwrapped = _make_env()
+        vec_env = DummyVecEnv([lambda: inner_env_unwrapped])
+        
+        n_stack = self.env_cfg.get("frame_stack", 1)
+        if n_stack > 1:
+            vec_env = VecFrameStack(vec_env, n_stack=n_stack)
+
+        inner_env: TradingEnv = inner_env_unwrapped.env if _HAS_MASKER else inner_env_unwrapped
 
         # ------------------------------------------------------------------
         # Optional visualiser
@@ -146,7 +152,8 @@ class Evaluator:
         episode_summaries: list[dict]       = []
 
         for ep in range(n_episodes):
-            eval_env.reset()
+            obs = vec_env.reset()
+            obs = obs[0]
             agent.reset()
 
             if vis is not None:
@@ -156,37 +163,33 @@ class Evaluator:
             equity_curve = [inner_env._balance]
 
             while not done:
-                action = agent.act(inner_env)
+                action = agent.act(inner_env, obs)
 
-                obs, reward, terminated, truncated, info = eval_env.step(action)
-                done = terminated or truncated
+                obs, vec_reward, vec_done, vec_info = vec_env.step([action])
+                obs = obs[0]
+                reward = vec_reward[0]
+                done = vec_done[0]
+                info = vec_info[0]
 
-                price  = inner_env._current_price()
-                equity = inner_env._balance + inner_env._sim.total_unrealized_pnl(price)
+                terminal_info = info.get("terminal_info", info)
 
-                if vis is not None:
+                equity = terminal_info.get("equity", info.get("equity", inner_env._balance))
+
+                if vis is not None and not done:
                     vis.update(inner_env, float(reward), action=action)
 
                 equity_curve.append(equity)
 
-                ct = info.get("closed_trade")
-                if ct is not None:
-                    trade = ct.to_dict()
-                    trade.update({"episode": ep + 1, "agent": agent.name})
-                    all_trades.append(trade)
-
                 if done:
-                    stats = inner_env.episode_stats()
-                    episode_summaries.append(stats)
+                    stats = terminal_info.get("episode_stats") or info.get("episode_stats")
+                    if stats:
+                        episode_summaries.append(stats)
 
-                    # Collect forced closes from episode_stats — they don't
-                    # appear in info["closed_trade"] since they happen in bulk
-                    # at termination. Tag them so the CSV is complete.
-                    for forced_trade in inner_env._episode_trades:
-                        if forced_trade.forced:
-                            td = forced_trade.to_dict()
-                            td.update({"episode": ep + 1, "agent": agent.name})
-                            all_trades.append(td)
+                    eps_trades = terminal_info.get("episode_trades") or info.get("episode_trades", [])
+                    for td_obj in eps_trades:
+                        td = td_obj.to_dict()
+                        td.update({"episode": ep + 1, "agent": agent.name})
+                        all_trades.append(td)
 
                     if vis is not None:
                         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -207,7 +210,7 @@ class Evaluator:
 
         if vis is not None:
             vis.close()
-        eval_env.close()
+        vec_env.close()
 
         # ------------------------------------------------------------------
         # Metrics + output

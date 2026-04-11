@@ -51,7 +51,7 @@ class RandomStrategy(BaseStrategy):
     def reset(self) -> None:
         pass
 
-    def act(self, env: "TradingEnv") -> int:
+    def act(self, env: "TradingEnv", obs: Optional[np.ndarray] = None) -> int:
         return int(self._rng.integers(0, env.n_actions))
 
 
@@ -88,7 +88,7 @@ class MACrossStrategy(BaseStrategy):
         self._prev_fast_above = None
         self._pending_action  = None
 
-    def act(self, env: "TradingEnv") -> int:
+    def act(self, env: "TradingEnv", obs: Optional[np.ndarray] = None) -> int:
         if self._pending_action is not None:
             action               = self._pending_action
             self._pending_action = None

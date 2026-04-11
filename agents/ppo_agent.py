@@ -47,10 +47,11 @@ class PPOAgent(BaseAgent):
     # BaseAgent interface
     # ------------------------------------------------------------------
 
-    def act(self, env: "TradingEnv") -> int:
+    def act(self, env: "TradingEnv", obs: Optional[np.ndarray] = None) -> int:
         if self.model is None:
             raise RuntimeError("PPOAgent has no model loaded. Call load() first.")
-        obs          = env._observation()
+        if obs is None:
+            obs = env._observation()
         action_masks = env.action_masks()
         action, _    = self.model.predict(
             obs[np.newaxis, :],

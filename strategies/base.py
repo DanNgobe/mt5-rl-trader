@@ -33,7 +33,7 @@ class BaseStrategy(BaseAgent):
     name: str = "base_strategy"
 
     @abstractmethod
-    def act(self, env: "TradingEnv") -> int:
+    def act(self, env: "TradingEnv", obs: Optional[np.ndarray] = None) -> int:
         """Return a scalar action int for the current step."""
 
     def _prices_up_to_now(self, env: "TradingEnv") -> np.ndarray:

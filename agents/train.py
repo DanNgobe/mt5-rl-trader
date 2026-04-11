@@ -21,7 +21,7 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
 )
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
 
 from core.config import load_config, load_symbol_spec
 from env.preprocessor import load_symbol_files
@@ -225,6 +225,11 @@ def train(
     VecEnvCls = DummyVecEnv if len(env_fns) == 1 else SubprocVecEnv
     vec_env   = VecEnvCls(env_fns)
     eval_env  = VecEnvCls(eval_env_fns)
+
+    n_stack = env_cfg.get("frame_stack", 1)
+    if n_stack > 1:
+        vec_env = VecFrameStack(vec_env, n_stack=n_stack)
+        eval_env = VecFrameStack(eval_env, n_stack=n_stack)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir   = Path(train_cfg["log_dir"]) / f"ppo_{timestamp}"

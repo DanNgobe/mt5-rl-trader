@@ -37,7 +37,7 @@ class BaseAgent(ABC):
         """Called at the start of every episode.  Override if stateful."""
 
     @abstractmethod
-    def act(self, env: "TradingEnv") -> int:
+    def act(self, env: "TradingEnv", obs: Optional[np.ndarray] = None) -> int:
         """
         Returns:
             int in [0, env.n_actions-1] — Discrete action index.

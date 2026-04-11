@@ -98,6 +98,25 @@ def compute_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     return ((atr / np.where(close > 0, close, 1.0)) * 100.0).astype(np.float32)
 
 
+def compute_macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> np.ndarray:
+    """
+    MACD (Moving Average Convergence Divergence).
+    Returns (n, 2) array: [MACD Line, MACD Signal]
+    Normalised by price to be scale-invariant.
+    """
+    close     = np.asarray(close, dtype=np.float64)
+    ema_fast  = pd.Series(close).ewm(span=fast, adjust=False).mean().to_numpy()
+    ema_slow  = pd.Series(close).ewm(span=slow, adjust=False).mean().to_numpy()
+    
+    macd_line = (ema_fast - ema_slow) / np.where(close > 0, close, 1.0) * 100.0
+    macd_signal = pd.Series(macd_line).ewm(span=signal, adjust=False).mean().to_numpy()
+    
+    result = np.zeros((len(close), 2), dtype=np.float32)
+    result[:, 0] = np.clip(macd_line, -2.0, 2.0).astype(np.float32)
+    result[:, 1] = np.clip(macd_signal, -2.0, 2.0).astype(np.float32)
+    return result
+
+
 def compute_ema_ratio(close: np.ndarray, fast: int = 8, slow: int = 21) -> np.ndarray:
     """
     EMA(fast)/EMA(slow) - 1.
@@ -181,6 +200,7 @@ def obs_dim_from_config(obs_cfg: dict, n_slots: int) -> int:
     dim += len(obs_cfg.get("price_lags", [1, 2, 4, 8, 24]))
     if ind.get("rsi",      {}).get("enabled", True):  dim += 1
     if ind.get("atr",      {}).get("enabled", True):  dim += 1
+    if ind.get("macd",     {}).get("enabled", True):  dim += 2
     if ind.get("ema_ratio",{}).get("enabled", True):  dim += 1
     if ind.get("bollinger",{}).get("enabled", True):  dim += 1
     if ind.get("momentum", {}).get("enabled", True):
@@ -233,6 +253,13 @@ def build_obs_arrays(
 
     if ind.get("atr", {}).get("enabled", True):
         arrays["atr"] = compute_atr(high, low, close, ind["atr"].get("period", 14))
+
+    if ind.get("macd", {}).get("enabled", True):
+        cfg = ind.get("macd", {})
+        arrays["macd"] = compute_macd(close,
+                                      cfg.get("fast", 12),
+                                      cfg.get("slow", 26),
+                                      cfg.get("signal", 9))
 
     if ind.get("ema_ratio", {}).get("enabled", True):
         cfg = ind.get("ema_ratio", {})

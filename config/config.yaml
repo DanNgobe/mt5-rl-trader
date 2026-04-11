@@ -28,6 +28,9 @@ environment:
   # Evaluator always uses random_start: false to run the full dataset.
   random_start: true
 
+  # VecEnv Stack frames (number of past observations to stack)
+  frame_stack: 4
+
 
 # Data Configuration
 # ==================
@@ -81,7 +84,7 @@ reward:
   # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
   # Encourages slow, stable growth over highly chaotic/volatile equity curves.
   # range: [0.1, 2.0] — disabled for now to allow basic convergence.
-  volatility_penalty_multiplier: 0.5
+  volatility_penalty_multiplier: 0
 
 
 # Observation Configuration
@@ -99,6 +102,12 @@ observation:
     atr:
       enabled: true
       period: 14        # range: [7, 21]
+
+    macd:
+      enabled: true
+      fast: 12
+      slow: 26
+      signal: 9
 
     ema_ratio:
       enabled: true

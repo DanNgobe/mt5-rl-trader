@@ -262,6 +262,7 @@ class TradingEnv(gym.Env):
         info = self._info(closed_trade=closed_trade, equity=equity)
         if terminated:
             info["episode_stats"] = self.episode_stats()
+            info["episode_trades"] = list(self._episode_trades)
 
         return obs, float(reward), terminated, False, info
 
@@ -400,6 +401,9 @@ class TradingEnv(gym.Env):
 
         if ind.get("atr",       {}).get("enabled", True):
             parts.append(float(self.obs_arrays["atr"][t]))
+
+        if ind.get("macd",      {}).get("enabled", True):
+            parts.extend(self.obs_arrays["macd"][t].tolist())
 
         if ind.get("ema_ratio", {}).get("enabled", True):
             parts.append(float(self.obs_arrays["ema_ratio"][t]))
