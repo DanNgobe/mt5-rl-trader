@@ -111,6 +111,27 @@ def compute_ema_ratio(close: np.ndarray, fast: int = 8, slow: int = 21) -> np.nd
     return np.clip(ratio, -0.1, 0.1).astype(np.float32)
 
 
+def compute_macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> np.ndarray:
+    """
+    MACD, MACD Signal, and MACD Histogram normalised by close.
+    Returns float32 array of shape (n, 3).
+    """
+    close = np.asarray(close, dtype=np.float64)
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+    macd = ema_fast - ema_slow
+    macd_signal = _ema(macd, signal)
+    macd_hist = macd - macd_signal
+    
+    # Scale relative to close * 100 for network stability
+    norm_close = np.where(close > 0, close, 1.0)
+    macd_norm = (macd / norm_close) * 100.0
+    signal_norm = (macd_signal / norm_close) * 100.0
+    hist_norm = (macd_hist / norm_close) * 100.0
+    
+    return np.column_stack([macd_norm, signal_norm, hist_norm]).astype(np.float32)
+
+
 def compute_bollinger_pct(close: np.ndarray, period: int = 20,
                           std_dev: float = 2.0) -> np.ndarray:
     """
@@ -183,6 +204,7 @@ def obs_dim_from_config(obs_cfg: dict, n_slots: int) -> int:
     if ind.get("atr",      {}).get("enabled", True):  dim += 1
     if ind.get("ema_ratio",{}).get("enabled", True):  dim += 1
     if ind.get("bollinger",{}).get("enabled", True):  dim += 1
+    if ind.get("macd",     {}).get("enabled", True):  dim += 3
     if ind.get("momentum", {}).get("enabled", True):
         dim += len(ind["momentum"].get("periods", [5, 20, 50]))
     if ind.get("session",  {}).get("enabled", True):  dim += 4
@@ -245,6 +267,13 @@ def build_obs_arrays(
         arrays["bollinger"] = compute_bollinger_pct(close,
                                                     cfg.get("period", 20),
                                                     cfg.get("std_dev", 2.0))
+
+    if ind.get("macd", {}).get("enabled", True):
+        cfg = ind.get("macd", {})
+        arrays["macd"] = compute_macd(close,
+                                      cfg.get("fast", 12),
+                                      cfg.get("slow", 26),
+                                      cfg.get("signal", 9))
 
     if ind.get("momentum", {}).get("enabled", True):
         periods = ind["momentum"].get("periods", [5, 20, 50])

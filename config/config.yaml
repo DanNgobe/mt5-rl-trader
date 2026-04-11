@@ -57,7 +57,7 @@ reward:
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
   # range: [0.0, 0.0000005]
-  flat_penalty_per_step: 0.0
+  flat_penalty_per_step: 0.00001
 
   # Spread cost multiplier on open. 1.0 = full round-trip charged upfront.
   # range: [1.0, 2.0] — 1.0 charges exactly the spread, 2.0 is most conservative
@@ -81,7 +81,7 @@ reward:
   # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
   # Encourages slow, stable growth over highly chaotic/volatile equity curves.
   # range: [0.1, 2.0] — disabled for now to allow basic convergence.
-  volatility_penalty_multiplier: 0.5
+  volatility_penalty_multiplier: 0
 
 
 # Observation Configuration
@@ -114,6 +114,12 @@ observation:
       enabled: true
       periods: [5, 20, 50]   # range: any 2–4 values spanning short/medium/long term
 
+    macd:
+      enabled: true
+      fast: 12          # range: [8, 15]
+      slow: 26          # range: [21, 35]
+      signal: 9         # range: [7, 12]
+
     session:
       enabled: true     # hour_sin, hour_cos, dow_sin, dow_cos — free 4 features, keep on
 
@@ -128,8 +134,8 @@ preprocessing:
 # PPO Agent Hyperparameters
 # =========================
 agent:
-  algorithm: PPO
-  policy: MlpPolicy
+  algorithm: RecurrentPPO
+  policy: MlpLstmPolicy
 
   # Network architecture. Scale up if obs space grows significantly.
   # range: [64,64] to [256,256] — deeper rarely helps for tabular obs

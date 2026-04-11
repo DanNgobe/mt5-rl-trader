@@ -14,12 +14,11 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
-from sb3_contrib.common.wrappers import ActionMasker
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
+    EvalCallback,
 )
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
@@ -33,11 +32,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Environment factory
 # ---------------------------------------------------------------------------
-
-def _get_action_masks(env) -> np.ndarray:
-    """Top-level callable for ActionMasker — picklable for SubprocVecEnv on Windows."""
-    return env.action_masks()
-
 
 def _make_env_fn(
     obs_arrays:  dict,
@@ -70,7 +64,6 @@ def _make_env_fn(
             random_start           = env_config.get("random_start", False),
             render_mode            = None,
         )
-        env = ActionMasker(env, _get_action_masks)
         env.reset(seed=seed)
         return env
     return _init
@@ -120,60 +113,10 @@ class TradingMetricsCallback(BaseCallback):
 # ONNX export
 # ---------------------------------------------------------------------------
 
-def export_onnx(model: MaskablePPO, output_path: str, obs_dim: int) -> bool:
+def export_onnx(model: RecurrentPPO, output_path: str, obs_dim: int) -> bool:
     """Export the trained SB3 policy to ONNX for MT5 deployment."""
-    try:
-        import torch
-        import torch.nn as nn
-    except ImportError:
-        log.error("PyTorch not installed — cannot export ONNX.")
-        return False
-
-    try:
-        policy = model.policy
-        policy.eval()
-
-        from pathlib import Path as _Path
-        out = _Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        class _PolicyExport(nn.Module):
-            def __init__(self, p):
-                super().__init__()
-                self.p = p
-            def forward(self, obs: torch.Tensor) -> torch.Tensor:
-                features     = self.p.extract_features(obs)
-                latent_pi, _ = self.p.mlp_extractor(features)
-                return self.p.action_net(latent_pi)
-
-        wrapper   = _PolicyExport(policy)
-        wrapper.eval()
-        dummy_obs = torch.zeros(1, obs_dim, dtype=torch.float32)
-        tmp_path  = str(out) + ".tmp.onnx"
-
-        with torch.no_grad():
-            torch.onnx.export(
-                wrapper, dummy_obs, tmp_path,
-                input_names=["observation"], output_names=["action_logits"],
-                opset_version=12, do_constant_folding=True, dynamo=False,
-            )
-
-        try:
-            import onnx, os
-            proto = onnx.load(tmp_path)
-            onnx.checker.check_model(proto)
-            onnx.save(proto, str(out))
-            os.remove(tmp_path)
-            log.info("ONNX validated and saved → %s", out)
-        except ImportError:
-            import os
-            os.replace(tmp_path, str(out))
-            log.warning("onnx package not installed — skipping validation.")
-
-        return True
-    except Exception as exc:
-        log.error("ONNX export failed: %s", exc, exc_info=True)
-        return False
+    log.warning("ONNX export is currently disabled for RecurrentPPO.")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +131,7 @@ def train(
     output_dir:      str                  = "models",
     total_timesteps: Optional[int]        = None,
     seed:            int                  = 42,
-) -> MaskablePPO:
+) -> RecurrentPPO:
     config      = load_config(config_path)
     env_cfg     = config["environment"]
     train_cfg   = config["training"]
@@ -238,10 +181,10 @@ def train(
 
     if model_path is not None:
         log.info("Continuing training from %s", model_path)
-        model = MaskablePPO.load(model_path, env=vec_env)
+        model = RecurrentPPO.load(model_path, env=vec_env)
     else:
-        log.info("Building new MaskablePPO model.")
-        model = MaskablePPO(
+        log.info("Building new RecurrentPPO model.")
+        model = RecurrentPPO(
             policy              = agent_cfg["policy"],
             env                 = vec_env,
             learning_rate       = agent_cfg["learning_rate"],
@@ -276,7 +219,7 @@ def train(
 
     if train_cfg.get("eval_freq", 0) > 0:
         callbacks.append(
-            MaskableEvalCallback(
+            EvalCallback(
                 eval_env,
                 best_model_save_path = str(model_dir),
                 log_path             = str(log_dir),

@@ -14,7 +14,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from sb3_contrib import MaskablePPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from core.agent import BaseAgent
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 class PPOAgent(BaseAgent):
     """
-    MaskablePPO model wrapped as a BaseAgent.
+    RecurrentPPO model wrapped as a BaseAgent.
 
     Parameters
     ----------
@@ -39,7 +39,9 @@ class PPOAgent(BaseAgent):
     name = "ppo"
 
     def __init__(self, model_path: Optional[str] = None):
-        self.model: Optional[MaskablePPO] = None
+        self.model: Optional[RecurrentPPO] = None
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
         if model_path is not None:
             self.load(model_path)
 
@@ -47,28 +49,34 @@ class PPOAgent(BaseAgent):
     # BaseAgent interface
     # ------------------------------------------------------------------
 
+    def reset(self) -> None:
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+
     def act(self, env: "TradingEnv") -> int:
         if self.model is None:
             raise RuntimeError("PPOAgent has no model loaded. Call load() first.")
-        obs          = env._observation()
-        action_masks = env.action_masks()
-        action, _    = self.model.predict(
+        obs = env._observation()
+        
+        action, self.lstm_states = self.model.predict(
             obs[np.newaxis, :],
-            action_masks=action_masks[np.newaxis, :],
+            state=self.lstm_states,
+            episode_start=self.episode_starts,
             deterministic=True,
         )
+        self.episode_starts = np.zeros((1,), dtype=bool)
         return int(action[0])
 
     def load(self, path: str) -> None:
-        log.info("Loading MaskablePPO model from %s", path)
-        self.model = MaskablePPO.load(path, device="cpu")
+        log.info("Loading RecurrentPPO model from %s", path)
+        self.model = RecurrentPPO.load(path, device="cpu")
         self.name  = f"ppo:{path}"
 
     def save(self, path: str) -> None:
         if self.model is None:
             raise RuntimeError("No model to save.")
         self.model.save(path)
-        log.info("MaskablePPO model saved → %s", path)
+        log.info("RecurrentPPO model saved → %s", path)
 
     # ------------------------------------------------------------------
     # Training helper — attach a vec env before training

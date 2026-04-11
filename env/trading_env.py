@@ -280,14 +280,6 @@ class TradingEnv(gym.Env):
         pass
 
     # ------------------------------------------------------------------
-    # Action masking (MaskablePPO / sb3-contrib)
-    # ------------------------------------------------------------------
-
-    def action_masks(self) -> np.ndarray:
-        """All actions always valid — toggle logic handles open vs close."""
-        return np.ones(self.n_actions, dtype=bool)
-
-    # ------------------------------------------------------------------
     # Episode stats
     # ------------------------------------------------------------------
 
@@ -406,6 +398,10 @@ class TradingEnv(gym.Env):
 
         if ind.get("bollinger", {}).get("enabled", True):
             parts.append(float(self.obs_arrays["bollinger"][t]))
+
+        if ind.get("macd", {}).get("enabled", True):
+            macd_vals = self.obs_arrays["macd"][t]
+            parts.extend(macd_vals.tolist())
 
         if ind.get("momentum",  {}).get("enabled", True):
             mom = self.obs_arrays["momentum"][t]   # shape (n_periods,)

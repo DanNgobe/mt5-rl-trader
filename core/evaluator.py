@@ -23,12 +23,6 @@ from core.metrics import calculate_metrics, print_metrics, save_results
 from env.preprocessor import build_obs_arrays, load_csv, load_npy, preprocess
 from env.trading_env import TradingEnv
 
-try:
-    from sb3_contrib.common.wrappers import ActionMasker
-    _HAS_MASKER = True
-except ImportError:
-    _HAS_MASKER = False
-
 log = logging.getLogger(__name__)
 
 
@@ -120,12 +114,10 @@ class Evaluator:
                 max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
                 render_mode            = None,
             )
-            if _HAS_MASKER:
-                env = ActionMasker(env, lambda e: e.action_masks())
             return env
 
         eval_env = _make_env()
-        inner_env: TradingEnv = eval_env.env if _HAS_MASKER else eval_env
+        inner_env: TradingEnv = eval_env
 
         # ------------------------------------------------------------------
         # Optional visualiser
