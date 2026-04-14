@@ -151,20 +151,24 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     strategy_name = args.strategy.lower()
 
     if strategy_name == "random":
-        from strategies.baselines import RandomStrategy
+        from strategies.random_strategy import RandomStrategy
         strategy = RandomStrategy(seed=args.seed, lot_tier=args.lot_tier)
 
     elif strategy_name == "ma_cross":
-        from strategies.baselines import MACrossStrategy
+        from strategies.ma_cross_strategy import MACrossStrategy
         strategy = MACrossStrategy(
             fast     = args.fast,
             slow     = args.slow,
             lot_tier = args.lot_tier,
         )
 
+    elif strategy_name == "martingale":
+        from strategies.martingale_strategy import MartingaleBaseline
+        strategy = MartingaleBaseline()
+
     else:
         log.error(
-            "Unknown strategy '%s'. Choices: random, ma_cross", strategy_name
+            "Unknown strategy '%s'. Choices: random, ma_cross, martingale", strategy_name
         )
         return 1
 
@@ -267,11 +271,36 @@ Examples:
     ev.add_argument("--vis-pause",    type=float, default=0.01, metavar="SEC")
     ev.set_defaults(func=cmd_evaluate)
 
+    # ---- pretrain --------------------------------------------------------
+    pt = sub.add_parser("pretrain", help="Pretrain RL agent using Imitation Learning (Behavioral Cloning)")
+    pt.add_argument("--expert",   required=True, choices=["martingale", "ma_cross"], help="Expert strategy to imitate")
+    pt.add_argument("--data",     required=True, help="Directory containing SYMBOL.csv files (data/raw)")
+    pt.add_argument("--symbols",  nargs="*", default=None, help="Symbols to train on (default: all files in --data)")
+    pt.add_argument("--config",   default="config/config.yaml")
+    pt.add_argument("--epochs",   type=int, default=5, help="Epochs for BC training")
+    pt.add_argument("--output",   default="models/ppo_pretrained.zip")
+    pt.add_argument("--seed",     type=int, default=42)
+    def cmd_pretrain(args: argparse.Namespace) -> int:
+        from agents.pretrain import pretrain
+        log = logging.getLogger("pretrain")
+        log.info("Starting behavioral cloning pre-training.")
+        pretrain(
+            expert_name=args.expert,
+            data_dir=args.data,
+            symbols=args.symbols,
+            config_path=args.config,
+            output_path=args.output,
+            epochs=args.epochs,
+            seed=args.seed,
+        )
+        return 0
+    pt.set_defaults(func=cmd_pretrain)
+
     # ---- baseline --------------------------------------------------------
     bl = sub.add_parser("baseline", help="Run and evaluate a hand-coded strategy")
     bl.add_argument(
         "--strategy", required=True,
-        choices=["random", "ma_cross"],
+        choices=["random", "ma_cross", "martingale"],
         help="Strategy to run",
     )
     bl.add_argument("--data",     required=True, help="Path to OHLCV CSV file")

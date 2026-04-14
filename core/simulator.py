@@ -86,15 +86,17 @@ class ClosedTrade:
     ticket:      int
     direction:   Direction
     lot_size:    float
-    entry_price: float
-    exit_price:  float
+    entry_price: float   # fill price at open (after spread/slippage)
+    exit_price:  float   # fill price at close (after spread/slippage)
     pnl:         float
     spread_paid: float
     slippage:    float
-    mfe_pnl:     float  # P&L at the most favourable price reached
-    mae_pnl:     float  # P&L at the most adverse price reached
-    open_step:   int    = 0
-    forced:      bool   = False  # True when closed by episode termination, not agent choice
+    mfe_pnl:     float   # P&L at the most favourable price reached
+    mae_pnl:     float   # P&L at the most adverse price reached
+    open_step:   int     = 0
+    forced:      bool    = False  # True when closed by episode termination, not agent choice
+    open_price:  float   = 0.0   # raw market price at open (no spread/slippage) — use for visualisation
+    close_price: float   = 0.0   # raw market price at close (no spread/slippage) — use for visualisation
 
     def to_dict(self) -> dict:
         return {
@@ -260,6 +262,8 @@ class TradeSimulator:
             mfe_pnl     = mfe_pnl,
             mae_pnl     = mae_pnl,
             open_step   = target.open_step,
+            open_price  = target.open_price,
+            close_price = market_price,
         )
         self._positions.remove(target)
         self._closed_trades.append(trade)

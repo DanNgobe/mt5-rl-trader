@@ -11,7 +11,7 @@ environment:
 
   # Lot size tiers for the 6 non-HOLD actions: [small, medium, large]
   # BUY/SELL at each tier toggles open/close. Max 6 simultaneous positions.
-  lot_tiers: [0.01, 0.02, 0.05]
+  lot_tiers: [0.1, 0.2, 0.5]
 
   # Episode termination: equity drawdown fraction that triggers margin call.
   # 0.5 = episode ends when equity drops to 50% of initial_balance.

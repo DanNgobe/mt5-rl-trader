@@ -222,14 +222,15 @@ class EpisodeVisualiser:
         reward : Scalar reward returned by env.step() this step.
         action : int in [0, n_actions-1] (Discrete) or None (treated as HOLD).
         """
-        step  = env._step
-        price = env._current_price()
+        # Redefine step and price to match the bar where the action was applied
+        step  = env._step - 1
+        price = env.raw_close[step]
 
         unrealized = env._sim.total_unrealized_pnl(price)
         equity     = env._balance + unrealized
 
         # Record action index (0=HOLD if action is None)
-        direction_idx = int(action) if action is not None else _A_HOLD
+        direction_idx = int(action) if action is not None else 0
 
         self._prices.append(price)
         self._equities.append(equity)
@@ -241,9 +242,13 @@ class EpisodeVisualiser:
         n_trades = len(env._episode_trades)
         if n_trades > self._last_trade_count:
             for trade in env._episode_trades[self._last_trade_count:]:
-                self._close_markers.append((step, float(trade.exit_price)))
+                # Use raw market prices so markers sit on the price line,
+                # not offset by spread/slippage.
+                self._close_markers.append((step, float(trade.close_price)))
                 self._closed_trade_lines.append(
-                    (trade.open_step, float(trade.entry_price), step, float(trade.exit_price), trade.direction.name)
+                    (trade.open_step, float(trade.open_price),
+                     step, float(trade.close_price),
+                     trade.direction.name)
                 )
             self._last_trade_count = n_trades
 
@@ -251,10 +256,12 @@ class EpisodeVisualiser:
         n_open = len(env._sim._positions)
         if n_open > self._last_n_positions:
             newest = env._sim._positions[-1]
+            # Use open_price (raw market, no spread/slippage) so the marker
+            # lands exactly on the price line rather than above/below it.
             if newest.direction.name == "LONG":
-                self._buy_markers.append((step, float(newest.entry_price)))
+                self._buy_markers.append((step, float(newest.open_price)))
             else:
-                self._sell_markers.append((step, float(newest.entry_price)))
+                self._sell_markers.append((step, float(newest.open_price)))
         self._last_n_positions = n_open
 
         if self._fig is None:
@@ -392,15 +399,28 @@ class EpisodeVisualiser:
                 ax_price.scatter(s, p, marker="D", color=_AMBER,
                                  s=55, zorder=5, linewidths=0)
 
-        # Dashed horizontal lines for open position entries
+        # Dashed horizontal lines at each open position's raw entry price
         for pos in env._sim._positions:
+            is_long = pos.direction.name == "LONG"
+            colour  = _GREEN if is_long else _RED
             ax_price.axhline(
-                pos.entry_price,
-                color     = _GREEN if pos.direction.name == "LONG" else _RED,
+                pos.open_price,
+                color     = colour,
                 linewidth = 0.8,
                 linestyle = "--",
-                alpha     = 0.55,
+                alpha     = 0.6,
                 zorder    = 1,
+            )
+            # Label at the right edge showing direction + lot size
+            ax_price.annotate(
+                f"{'L' if is_long else 'S'} {pos.lot_size:g}",
+                xy        = (vis_steps[-1] if len(vis_steps) else 0, pos.open_price),
+                xytext    = (4, 0),
+                textcoords= "offset points",
+                color     = colour,
+                fontsize  = 6.5,
+                va        = "center",
+                alpha     = 0.8,
             )
 
         legend_elements = [
@@ -410,6 +430,10 @@ class EpisodeVisualiser:
                          markerfacecolor=_RED,    markersize=8, label="Sell open"),
             self._Line2D([0], [0], marker="D", color="w",
                          markerfacecolor=_AMBER,  markersize=7, label="Close"),
+            self._Line2D([0], [0], color=_GREEN, linewidth=0.8,
+                         linestyle="--", label="Entry (L)"),
+            self._Line2D([0], [0], color=_RED,   linewidth=0.8,
+                         linestyle="--", label="Entry (S)"),
         ]
         ax_price.legend(
             handles=legend_elements, loc="upper left",
