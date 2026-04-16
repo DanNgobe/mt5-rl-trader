@@ -68,6 +68,7 @@ def _make_env_fn(
             max_drawdown_pct       = env_config.get("max_drawdown_pct", 0.5),
             episode_length         = env_config.get("episode_length"),
             random_start           = env_config.get("random_start", False),
+            max_positions          = env_config.get("max_positions"),
             render_mode            = None,
         )
         env = ActionMasker(env, _get_action_masks)

@@ -115,6 +115,7 @@ def pretrain(
             max_drawdown_pct       = env_cfg.get("max_drawdown_pct", 0.5),
             episode_length         = env_cfg.get("episode_length"),
             random_start           = True,
+            max_positions          = env_cfg.get("max_positions"),
         )
         env = ActionMasker(env, _get_action_masks)
         env.reset(seed=seed)

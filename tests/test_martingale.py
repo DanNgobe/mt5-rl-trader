@@ -35,15 +35,15 @@ from strategies.martingale_strategy import MartingaleBaseline
 
 CONTRACT   = 100_000
 LOT_TIERS  = [0.1, 0.2, 0.5]
-N_ACTIONS  = 2 + 2 * len(LOT_TIERS)   # 8
-CLOSE_ALL  = N_ACTIONS - 1             # 7
+N_ACTIONS  = 2 + 4 * len(LOT_TIERS)   # 14
+CLOSE_ALL  = N_ACTIONS - 1             # 13
 HOLD       = 0
 LOSS_THR   = -2.0
 PROFIT_THR =  2.0
 
 
-def _buy(tier: int)  -> int: return 1 + tier * 2
-def _sell(tier: int) -> int: return 2 + tier * 2
+def _buy(tier: int)  -> int: return 1 + tier * 4
+def _sell(tier: int) -> int: return 2 + tier * 4
 
 
 def _make_position(
@@ -68,7 +68,7 @@ def _make_env(
     lot_tiers:     list = None,
 ) -> SimpleNamespace:
     lot_tiers = lot_tiers or LOT_TIERS
-    n_actions = 2 + 2 * len(lot_tiers)
+    n_actions = 2 + 4 * len(lot_tiers)
     env = SimpleNamespace(
         lot_tiers = lot_tiers,
         n_actions = n_actions,

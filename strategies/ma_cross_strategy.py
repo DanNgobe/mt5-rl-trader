@@ -62,9 +62,9 @@ class MACrossStrategy(BaseStrategy):
             tier = min(range(len(env.lot_tiers)),
                        key=lambda i: abs(env.lot_tiers[i] - wrong_pos.lot_size))
             if wrong_pos.direction == Direction.LONG:
-                return self._buy(tier)   # CLOSE the long
+                return self._close_buy(tier)   # CLOSE the long
             else:
-                return self._sell(tier)  # CLOSE the short
+                return self._close_sell(tier)  # CLOSE the short
 
         # 2. If flat, open in the target direction
         if not positions:

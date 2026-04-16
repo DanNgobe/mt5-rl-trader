@@ -118,6 +118,7 @@ class Evaluator:
                 volatility_penalty_multiplier = self._reward_cfg.get("volatility_penalty_multiplier", 0.0),
                 drawdown_penalty       = self._reward_cfg.get("drawdown_penalty", 5.0),
                 max_drawdown_pct       = self.env_cfg.get("max_drawdown_pct", 0.5),
+                max_positions          = self.env_cfg.get("max_positions"),
                 render_mode            = None,
             )
             if _HAS_MASKER:

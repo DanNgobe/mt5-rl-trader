@@ -44,6 +44,9 @@ input double InpInitialBalance = 1000.0; // Must match training initial_balance
 input group "=== Timeframe ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;
 
+input group "=== Observation slots ==="
+input int    InpMaxPositions   = 10;     // Number of model slots (n_slots). Must match training.
+
 //+------------------------------------------------------------------+
 //| Constants matching Python preprocessor defaults                  |
 //+------------------------------------------------------------------+
@@ -103,8 +106,8 @@ int OnInit()
     for(int i = 0; i < 3; i++)
         if(raw_tiers[i] > 1e-9) g_lot_tiers[t++] = raw_tiers[i];
 
-    g_n_actions = 2 + 2 * g_n_tiers;
-    g_n_slots   = g_n_tiers * 2;
+    g_n_actions = 2 + 4 * g_n_tiers;
+    g_n_slots   = InpMaxPositions;
 
     // obs_dim mirrors obs_dim_from_config() in preprocessor.py:
     //   price_lags + rsi + atr + ema_ratio + bollinger + momentum + session(4) + slots*3 + account(2)
@@ -258,7 +261,7 @@ void OnTick()
 
 
 //+------------------------------------------------------------------+
-//| Execute action — toggle semantics                                |
+//| Execute action — explicit logic                                  |
 //+------------------------------------------------------------------+
 void ExecuteAction(int action)
 {
@@ -284,45 +287,43 @@ void ExecuteAction(int action)
         return;
     }
 
-    // Decode tier and direction from action index
-    int tier      = (action - 1) / 2;
-    bool is_buy   = ((action - 1) % 2 == 0);
-    double lot    = g_lot_tiers[tier];
-    ENUM_POSITION_TYPE pos_type = is_buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+    // Explicit Action Logic Breakdown:
+    // Pattern: 1+i*4=OB, 2+i*4=OS, 3+i*4=CB, 4+i*4=CS
+    int tierIdx = (action - 1) / 4;
+    int typeIdx = (action - 1) % 4;
+    double lot  = g_lot_tiers[tierIdx];
 
-    // Toggle: close if matching position exists, else open
-    ulong match_ticket = FindOldestMatchingPosition(pos_type, lot);
-
-    if(match_ticket != 0)
+    if(typeIdx == 0 || typeIdx == 1) // OPEN (BUY or SELL)
     {
-        // Close
-        if(g_trade.PositionClose(match_ticket))
-            Print(StringFormat("CLOSE %s lot=%.2f ticket=%d",
-                               is_buy ? "LONG" : "SHORT", lot, (int)match_ticket));
-        else
-            Print("CLOSE failed: ", g_trade.ResultRetcodeDescription());
-    }
-    else
-    {
-        // Open
+        bool isBuy = (typeIdx == 0);
         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         bool ok;
-        if(is_buy)
-            ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "RL-BUY");
-        else
-            ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "RL-SELL");
+        if(isBuy) ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "RL-OPEN-B");
+        else      ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "RL-OPEN-S");
 
-        if(ok)
-        {
-            // Record open bar for bars_open tracking
+        if(ok) {
             ulong new_ticket = g_trade.ResultOrder();
             RegisterSlot(new_ticket, g_total_bars);
-            Print(StringFormat("OPEN %s lot=%.2f ticket=%d",
-                               is_buy ? "BUY" : "SELL", lot, (int)new_ticket));
-        }
-        else
+            Print(StringFormat("OPEN %s lot=%.2f ticket=%d", isBuy ? "BUY" : "SELL", lot, (int)new_ticket));
+        } else {
             Print("OPEN failed: ", g_trade.ResultRetcodeDescription());
+        }
+    }
+    else // CLOSE
+    {
+        bool isBuy = (typeIdx == 2); // Closing a LONG position (CLOSE_BUY)
+        ENUM_POSITION_TYPE targetType = isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+        ulong matchTicket = FindOldestMatchingPosition(targetType, lot);
+
+        if(matchTicket != 0) {
+            if(g_trade.PositionClose(matchTicket))
+                Print(StringFormat("CLOSE %s lot=%.2f ticket=%d", isBuy ? "LONG" : "SHORT", lot, (int)matchTicket));
+            else
+                Print("CLOSE failed: ", g_trade.ResultRetcodeDescription());
+        } else {
+            Print("CLOSE: no matching position to close.");
+        }
     }
 }
 
@@ -426,7 +427,7 @@ bool BuildObservation(float &obs[])
         double prev = rates[lag].close;
         double cur  = rates[lag - 1].close;   // one bar newer
         if(prev <= 0.0) prev = 1.0;
-        obs[fill++] = (float)MathLog(cur / prev);
+        obs[fill++] = (float)(MathLog(cur / prev) * 100.0);
     }
 
     // ------------------------------------------------------------------
@@ -467,7 +468,10 @@ bool BuildObservation(float &obs[])
     MqlDateTime dt;
     TimeToStruct(rates[0].time, dt);
     double hour = (double)dt.hour;
-    double dow  = (double)dt.day_of_week;   // 0=Sun..6=Sat; Python uses 0=Mon..4=Fri
+    // MT5: 0=Sun..6=Sat. Python default: 0=Mon..6=Sun. Matching Mon=0:
+    int dow_mql = dt.day_of_week;
+    double dow = (double)(dow_mql == 0 ? 6 : dow_mql - 1);
+    
     obs[fill++] = (float)MathSin(2.0 * M_PI * hour / 24.0);
     obs[fill++] = (float)MathCos(2.0 * M_PI * hour / 24.0);
     obs[fill++] = (float)MathSin(2.0 * M_PI * dow  / 5.0);
@@ -536,10 +540,12 @@ bool BuildObservation(float &obs[])
             double lot   = live_lot[s];
             double entry = live_entry[s];
             double upnl  = (cur_price - entry) * dir * lot * 100000.0 / InpInitialBalance;
-            double bars_norm = (double)live_bars[s] / (double)n_total_bars_approx;
+            // Bars norm uses a representative episode length or total session count.
+            // Python uses n_samples (bars in file). Approx scaling is usually enough.
+            double bars_norm = (double)live_bars[s] / 1000.0;
 
-            obs[fill++] = (float)(dir * lot);
-            obs[fill++] = (float)MathMax(-1.0, MathMin(1.0, upnl));
+            obs[fill++] = (float)(dir * lot * 10.0);
+            obs[fill++] = (float)MathMax(-1.0, MathMin(1.0, upnl * 10.0));
             obs[fill++] = (float)bars_norm;
         }
         else
@@ -551,10 +557,12 @@ bool BuildObservation(float &obs[])
     }
 
     // ------------------------------------------------------------------
-    // 9. Account state
+    // 9. Account state: (bal_delta / initial) * 10, (eq_delta / initial) * 10
     // ------------------------------------------------------------------
-    obs[fill++] = (float)(AccountInfoDouble(ACCOUNT_BALANCE) / InpInitialBalance);
-    obs[fill++] = (float)(AccountInfoDouble(ACCOUNT_EQUITY)  / InpInitialBalance);
+    double bal_norm = (AccountInfoDouble(ACCOUNT_BALANCE) - InpInitialBalance) / InpInitialBalance;
+    double eq_norm  = (AccountInfoDouble(ACCOUNT_EQUITY)  - InpInitialBalance) / InpInitialBalance;
+    obs[fill++] = (float)(bal_norm * 10.0);
+    obs[fill++] = (float)(eq_norm  * 10.0);
 
     return true;
 }
@@ -685,9 +693,15 @@ string ActionName(int action)
 {
     if(action == 0) return "HOLD";
     if(action == g_n_actions - 1) return "CLOSE_ALL";
-    int tier    = (action - 1) / 2;
-    bool is_buy = ((action - 1) % 2 == 0);
-    return StringFormat("%s lot=%.2f (tier %d)",
-                        is_buy ? "BUY" : "SELL", g_lot_tiers[tier], tier);
+    int tierIdx = (action - 1) / 4;
+    int typeIdx = (action - 1) % 4;
+    string typeStr = "";
+    switch(typeIdx) {
+        case 0: typeStr = "OPEN_BUY";  break;
+        case 1: typeStr = "OPEN_SELL"; break;
+        case 2: typeStr = "CLOSE_BUY"; break;
+        case 3: typeStr = "CLOSE_SELL"; break;
+    }
+    return StringFormat("%s lot=%.2f (tier %d)", typeStr, g_lot_tiers[tierIdx], tierIdx);
 }
 //+------------------------------------------------------------------+

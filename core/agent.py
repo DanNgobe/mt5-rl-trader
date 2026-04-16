@@ -59,10 +59,20 @@ class BaseAgent(ABC):
 
     @staticmethod
     def _buy(lot_tier: int = 0) -> int:
-        # lot_tier 0→action 1, 1→action 3, 2→action 5
-        return 1 + lot_tier * 2
+        # OPEN_BUY: lot_tier i → action 1 + i*4
+        return 1 + lot_tier * 4
 
     @staticmethod
     def _sell(lot_tier: int = 0) -> int:
-        # lot_tier 0→action 2, 1→action 4, 2→action 6
-        return 2 + lot_tier * 2
+        # OPEN_SELL: lot_tier i → action 2 + i*4
+        return 2 + lot_tier * 4
+
+    @staticmethod
+    def _close_buy(lot_tier: int = 0) -> int:
+        # CLOSE_BUY: lot_tier i → action 3 + i*4
+        return 3 + lot_tier * 4
+
+    @staticmethod
+    def _close_sell(lot_tier: int = 0) -> int:
+        # CLOSE_SELL: lot_tier i → action 4 + i*4
+        return 4 + lot_tier * 4

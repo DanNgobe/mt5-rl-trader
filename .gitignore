@@ -65,3 +65,4 @@ data/processed/
 data/evaluation/
 *.onnx
 models/model.onnx.data
+models

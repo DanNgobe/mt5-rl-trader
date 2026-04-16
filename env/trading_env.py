@@ -72,9 +72,10 @@ class TradingEnv(gym.Env):
         portfolio_offset_factor: float = 0.0,
         volatility_penalty_multiplier: float = 0.0,  # 0.0 to disable variance penalty
         drawdown_penalty:        float = 5.0,
+        random_start:            bool  = False,
         max_drawdown_pct:        float = 0.5,
         episode_length:          Optional[int] = None,
-        random_start:            bool  = False,
+        max_positions:           Optional[int] = 10,
         render_mode:             Optional[str] = None,
     ):
         super().__init__()
@@ -102,18 +103,26 @@ class TradingEnv(gym.Env):
         self.max_drawdown_pct        = max_drawdown_pct
         self.episode_length          = episode_length
         self.random_start            = random_start
+        self.max_positions           = max_positions
 
-        # Action map: action_idx → (Direction, lot_size)
-        # action 0 = HOLD, then BUY/SELL pairs per tier:
-        #   1 + tier*2 = BUY lot_tiers[tier]
-        #   2 + tier*2 = SELL lot_tiers[tier]
-        self._action_map: dict[int, tuple[Direction, float]] = {}
+        # Action map: action_idx → (type, Direction, lot_size)
+        # 0 = HOLD
+        # 1 + i*4 = OPEN_BUY
+        # 2 + i*4 = OPEN_SELL
+        # 3 + i*4 = CLOSE_BUY
+        # 4 + i*4 = CLOSE_SELL
+        # n_actions - 1 = CLOSE_ALL
+        self._action_map: dict[int, tuple[str, Direction, float]] = {}
         for i, lot in enumerate(self.lot_tiers):
-            self._action_map[1 + i * 2] = (Direction.LONG,  lot)
-            self._action_map[2 + i * 2] = (Direction.SHORT, lot)
+            self._action_map[1 + i * 4] = ("OPEN",  Direction.LONG,  lot)
+            self._action_map[2 + i * 4] = ("OPEN",  Direction.SHORT, lot)
+            self._action_map[3 + i * 4] = ("CLOSE", Direction.LONG,  lot)
+            self._action_map[4 + i * 4] = ("CLOSE", Direction.SHORT, lot)
 
-        self.n_actions = 2 + 2 * len(self.lot_tiers)   # HOLD + BUY/SELL per tier + CLOSE_ALL
-        self.n_slots   = len(self.lot_tiers) * 2        # max simultaneous positions
+        self.n_actions = 2 + 4 * len(self.lot_tiers)
+        # n_slots is the number of position slots in the observation vector.
+        # If max_positions is unlimited (None or 0), default to 10 slots.
+        self.n_slots   = max_positions if (max_positions is not None and max_positions > 0) else 10
 
         self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
         self._min_step = max(self._price_lags)
@@ -149,7 +158,8 @@ class TradingEnv(gym.Env):
         self._sim.reset()
         self._balance         = self.initial_balance
         self._episode_trades  = []
-        self._returns_buffer  = []
+        # Pre-fill with zeros so std starts at 0, not noisy cold-start values
+        self._returns_buffer  = [0.0] * 50
         self._prev_equity     = self.initial_balance
 
         if self.random_start and self.episode_length is not None:
@@ -195,22 +205,17 @@ class TradingEnv(gym.Env):
                             closed_trade = result.trade
                         reward += self._order_reward(result, is_close_all=True, offset_pool=offset_pool)
             else:
-                direction, lot_size = self._action_map[action]
-                # Toggle: close if a matching position exists, otherwise open
-                has_match = any(
-                    p.direction == direction and abs(p.lot_size - lot_size) < 1e-9
-                    for p in self._sim.positions
-                )
-                if has_match:
+                act_type, direction, lot_size = self._action_map[action]
+                if act_type == "CLOSE":
                     result = self._sim.close_position(current_price, direction, lot_size)
                     reward = self._order_reward(result, is_close_all=False)
                     if result.trade is not None:
                         closed_trade = result.trade
                         self._episode_trades.append(closed_trade)
-                else:
+                else: # OPEN
                     result = self._sim.open_position(current_price, direction, lot_size, self._step)
                     reward = self._order_reward(result, is_close_all=False)
-
+        
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
@@ -284,8 +289,38 @@ class TradingEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def action_masks(self) -> np.ndarray:
-        """All actions always valid — toggle logic handles open vs close."""
-        return np.ones(self.n_actions, dtype=bool)
+        """
+        Masking logic for explicit Open/Close action space.
+        """
+        mask = np.ones(self.n_actions, dtype=bool)
+        
+        # 1. HOLD (0) is always valid
+        
+        # 2. OPEN actions: Masked if max_positions reached
+        if self.max_positions is not None and self.max_positions > 0:
+            if len(self._sim.positions) >= self.max_positions:
+                for idx, (act_type, _, _) in self._action_map.items():
+                    if act_type == "OPEN":
+                        mask[idx] = False
+        
+        # 3. CLOSE actions: Masked if no matching position exists
+        # 4. CLOSE_ALL: Masked if no positions exist
+        has_pos = self._sim.has_positions
+        if not has_pos:
+            mask[self.n_actions - 1] = False # CLOSE_ALL
+            for idx, (act_type, _, _) in self._action_map.items():
+                if act_type == "CLOSE":
+                    mask[idx] = False
+        else:
+            # Check individual close actions
+            pos_info = [(p.direction, p.lot_size) for p in self._sim.positions]
+            for idx, (act_type, direction, lot_size) in self._action_map.items():
+                if act_type == "CLOSE":
+                    match = any(d == direction and abs(l - lot_size) < 1e-9 for d, l in pos_info)
+                    if not match:
+                        mask[idx] = False
+                        
+        return mask
 
     # ------------------------------------------------------------------
     # Episode stats

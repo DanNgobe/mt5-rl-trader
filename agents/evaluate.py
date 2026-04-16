@@ -31,10 +31,9 @@ def evaluate(
     if export_onnx_:
         from agents.train import export_onnx
         from env.preprocessor import obs_dim_from_config
-        obs_dim = obs_dim_from_config(
-            evaluator.obs_cfg,
-            len(evaluator.env_cfg.get("lot_tiers", [0.1, 0.2, 0.5])) * 2,
-        )
+        max_pos = evaluator.env_cfg.get("max_positions")
+        n_slots = max_pos if (max_pos is not None and max_pos > 0) else 10
+        obs_dim = obs_dim_from_config(evaluator.obs_cfg, n_slots)
         export_onnx(agent.model, onnx_path, obs_dim)
 
     return evaluator.run(

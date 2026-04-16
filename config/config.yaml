@@ -9,9 +9,17 @@ environment:
   slippage_prob: 0.3                 # range: [0.1, 0.5] — higher = more realistic, harder to train
   slippage_range: [0.00001, 0.0005]  # range: [0.00001, 0.001] — upper bound is ~10 pips
 
-  # Lot size tiers for the 6 non-HOLD actions: [small, medium, large]
-  # BUY/SELL at each tier toggles open/close. Max 6 simultaneous positions.
+  # Lot size tiers for the possible OPEN/CLOSE actions: [small, medium, large]
+  # Action Space:
+  #   0: HOLD
+  #   1 + tier*4: OPEN_BUY   2 + tier*4: OPEN_SELL
+  #   3 + tier*4: CLOSE_BUY  4 + tier*4: CLOSE_SELL
+  #   n_actions-1: CLOSE_ALL
   lot_tiers: [0.1, 0.2, 0.5]
+
+  # Maximum simultaneous positions allowed. 
+  # Set to 0 or null to disable (unlimited).
+  max_positions: 10
 
   # Episode termination: equity drawdown fraction that triggers margin call.
   # 0.5 = episode ends when equity drops to 50% of initial_balance.
@@ -60,8 +68,11 @@ reward:
   flat_penalty_per_step: 0.0
 
   # Spread cost multiplier on open. 1.0 = full round-trip charged upfront.
+  # In step mode, only (spread_cost_scale - 1.0) is charged explicitly (the rest
+  # is captured naturally in the equity delta). 1.0 = no explicit bite; 1.5 = half
+  # the spread charged on top of the equity drop, discouraging overtrading.
   # range: [1.0, 2.0] — 1.0 charges exactly the spread, 2.0 is most conservative
-  spread_cost_scale: 1.0
+  spread_cost_scale: 1.5
 
   # Portfolio-aware close rewards.
   # When closing all positions via CLOSE_ALL, offset any loss with the portfolio's unrealized gains.
@@ -81,7 +92,7 @@ reward:
   # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
   # Encourages slow, stable growth over highly chaotic/volatile equity curves.
   # range: [0.1, 2.0] — disabled for now to allow basic convergence.
-  volatility_penalty_multiplier: 0.5
+  volatility_penalty_multiplier: 0
 
 
 # Observation Configuration

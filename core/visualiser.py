@@ -69,20 +69,33 @@ _SELL_COLOURS = ["#f06474", "#c94455", "#a03040"]   # reds,   light → dark
 
 
 def _build_action_colours(lot_tiers: list) -> dict:
-    """Return {action_idx: colour} for a given lot_tiers list."""
+    """Return {action_idx: colour} for the new explicit action space."""
     colours = {0: "#4a5068"}   # HOLD → muted
     for i in range(len(lot_tiers)):
-        colours[1 + i * 2] = _BUY_COLOURS[min(i, len(_BUY_COLOURS) - 1)]
-        colours[2 + i * 2] = _SELL_COLOURS[min(i, len(_SELL_COLOURS) - 1)]
+        # Pattern: 1+i*4=OPEN_B, 2+i*4=OPEN_S, 3+i*4=CLOSE_B, 4+i*4=CLOSE_S
+        buy_col  = _BUY_COLOURS[min(i, len(_BUY_COLOURS) - 1)]
+        sell_col = _SELL_COLOURS[min(i, len(_SELL_COLOURS) - 1)]
+        colours[1 + i * 4] = buy_col   # OPEN_BUY
+        colours[2 + i * 4] = sell_col  # OPEN_SELL
+        colours[3 + i * 4] = _AMBER    # CLOSE_BUY
+        colours[4 + i * 4] = _AMBER    # CLOSE_SELL
+    
+    n_actions = 2 + 4 * len(lot_tiers)
+    colours[n_actions - 1] = _AMBER    # CLOSE_ALL
     return colours
 
 
 def _build_action_labels(lot_tiers: list) -> dict:
-    """Return {action_idx: label} for a given lot_tiers list."""
+    """Return {action_idx: label} for the new explicit action space."""
     labels = {0: "HOLD"}
     for i, lot in enumerate(lot_tiers):
-        labels[1 + i * 2] = f"B{lot:g}"
-        labels[2 + i * 2] = f"S{lot:g}"
+        labels[1 + i * 4] = f"OB{lot:g}"
+        labels[2 + i * 4] = f"OS{lot:g}"
+        labels[3 + i * 4] = f"CB{lot:g}"
+        labels[4 + i * 4] = f"CS{lot:g}"
+    
+    n_actions = 2 + 4 * len(lot_tiers)
+    labels[n_actions - 1] = "C_ALL"
     return labels
 
 # ---------------------------------------------------------------------------
