@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 from sb3_contrib import MaskablePPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from core.agent import BaseAgent
 
@@ -39,7 +39,8 @@ class PPOAgent(BaseAgent):
     name = "ppo"
 
     def __init__(self, model_path: Optional[str] = None):
-        self.model: Optional[MaskablePPO] = None
+        self.model:    Optional[MaskablePPO] = None
+        self.norm_env: Optional[VecNormalize] = None
         if model_path is not None:
             self.load(model_path)
 
@@ -50,8 +51,14 @@ class PPOAgent(BaseAgent):
     def act(self, env: "TradingEnv") -> int:
         if self.model is None:
             raise RuntimeError("PPOAgent has no model loaded. Call load() first.")
+        
         obs          = env._observation()
         action_masks = env.action_masks()
+
+        # Apply normalization if stats were loaded
+        if self.norm_env is not None:
+            obs = self.norm_env.normalize_obs(obs)
+
         action, _    = self.model.predict(
             obs[np.newaxis, :],
             action_masks=action_masks[np.newaxis, :],
@@ -60,9 +67,31 @@ class PPOAgent(BaseAgent):
         return int(action[0])
 
     def load(self, path: str) -> None:
+        from pathlib import Path
+        p = Path(path)
         log.info("Loading MaskablePPO model from %s", path)
         self.model = MaskablePPO.load(path, device="cpu")
         self.name  = f"ppo:{path}"
+
+        # Try to find VecNormalize stats
+        # Check parent dir for vec_normalize.pkl or vec_normalize_best.pkl
+        norm_files = ["vec_normalize.pkl", "vec_normalize_best.pkl"]
+        for f in norm_files:
+            norm_path = p.parent / f
+            if norm_path.exists():
+                log.info("Loading VecNormalize stats from %s", norm_path)
+                # We need a dummy env to load VecNormalize. lambda: None is no longer accepted.
+                import gymnasium as gym
+                class MinimalEnv(gym.Env):
+                    def __init__(self, obs_space, act_space):
+                        self.observation_space = obs_space
+                        self.action_space = act_space
+                
+                dummy_venv = DummyVecEnv([lambda: MinimalEnv(self.model.observation_space, self.model.action_space)])
+                self.norm_env = VecNormalize.load(str(norm_path), venv=dummy_venv)
+                self.norm_env.training = False
+                self.norm_env.norm_reward = False
+                break
 
     def save(self, path: str) -> None:
         if self.model is None:

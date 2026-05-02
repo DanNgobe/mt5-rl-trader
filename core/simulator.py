@@ -163,7 +163,8 @@ class TradeSimulator:
 
     @property
     def positions(self) -> list[Position]:
-        return list(self._positions)
+        """Direct reference to internal positions list. Callers must not mutate."""
+        return self._positions
 
     @property
     def n_positions(self) -> int:

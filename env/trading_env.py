@@ -13,14 +13,14 @@ Observation vector (all features configurable via obs_config)
     [position_slots]   len(lot_tiers)*2 slots × 3 features each
     [balance_norm, equity_norm]
 
-Action space — Discrete(2 + 2 * len(lot_tiers))
+Action space — Discrete(2 + 4 * len(lot_tiers))
 -------------------------------------------------
     0               = HOLD
-    1 + tier*2      = BUY  lot_tiers[tier]   (toggle: open or close)
-    2 + tier*2      = SELL lot_tiers[tier]   (toggle: open or close)
+    1 + tier*4      = OPEN_BUY   lot_tiers[tier]
+    2 + tier*4      = OPEN_SELL  lot_tiers[tier]
+    3 + tier*4      = CLOSE_BUY  lot_tiers[tier]
+    4 + tier*4      = CLOSE_SELL lot_tiers[tier]
     n_actions - 1   = CLOSE_ALL
-
-    All actions are always valid — no penalties.
 
 Reward
 ------
@@ -32,6 +32,7 @@ Reward
 """
 
 import logging
+from collections import deque
 from typing import Optional
 
 import gymnasium as gym
@@ -105,6 +106,9 @@ class TradingEnv(gym.Env):
         self.random_start            = random_start
         self.max_positions           = max_positions
 
+        # Pre-compute drawdown threshold — avoids a multiply every step
+        self._drawdown_threshold = initial_balance * (1.0 - max_drawdown_pct)
+
         # Action map: action_idx → (type, Direction, lot_size)
         # 0 = HOLD
         # 1 + i*4 = OPEN_BUY
@@ -119,6 +123,12 @@ class TradingEnv(gym.Env):
             self._action_map[3 + i * 4] = ("CLOSE", Direction.LONG,  lot)
             self._action_map[4 + i * 4] = ("CLOSE", Direction.SHORT, lot)
 
+        # Pre-split action indices by type for O(1) single-pass masking
+        self._open_indices:  list[int] = [idx for idx, (t, _, _) in self._action_map.items() if t == "OPEN"]
+        self._close_indices: list[tuple[int, Direction, float]] = [
+            (idx, d, l) for idx, (t, d, l) in self._action_map.items() if t == "CLOSE"
+        ]
+
         self.n_actions = 2 + 4 * len(self.lot_tiers)
         # n_slots is the number of position slots in the observation vector.
         # If max_positions is unlimited (None or 0), default to 10 slots.
@@ -127,9 +137,18 @@ class TradingEnv(gym.Env):
         self._price_lags: list[int] = obs_config.get("price_lags", [1, 2, 4, 8, 24])
         self._min_step = max(self._price_lags)
 
-        obs_dim = obs_dim_from_config(obs_config, self.n_slots)
+        # Cache obs dimension and indicator flags — avoids dict lookups every step
+        self._obs_dim = obs_dim_from_config(obs_config, self.n_slots)
+        ind = obs_config.get("indicators", {})
+        self._use_rsi      = ind.get("rsi",       {}).get("enabled", True)
+        self._use_atr      = ind.get("atr",       {}).get("enabled", True)
+        self._use_ema      = ind.get("ema_ratio",  {}).get("enabled", True)
+        self._use_boll     = ind.get("bollinger",  {}).get("enabled", True)
+        self._use_momentum = ind.get("momentum",   {}).get("enabled", True)
+        self._use_session  = ind.get("session",    {}).get("enabled", True)
+
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self._obs_dim,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(self.n_actions)
 
@@ -144,7 +163,8 @@ class TradingEnv(gym.Env):
         self._balance:        float             = initial_balance
         self._prev_equity:    float             = initial_balance
         self._episode_trades: list[ClosedTrade] = []
-        self._returns_buffer: list[float]       = []
+        # deque(maxlen=50): O(1) append+pop vs O(n) list.pop(0)
+        self._returns_buffer: deque             = deque([0.0] * 50, maxlen=50)
         self._start_step:     int               = self._min_step
         self._end_step:       int               = n
 
@@ -159,7 +179,7 @@ class TradingEnv(gym.Env):
         self._balance         = self.initial_balance
         self._episode_trades  = []
         # Pre-fill with zeros so std starts at 0, not noisy cold-start values
-        self._returns_buffer  = [0.0] * 50
+        self._returns_buffer  = deque([0.0] * 50, maxlen=50)
         self._prev_equity     = self.initial_balance
 
         if self.random_start and self.episode_length is not None:
@@ -181,7 +201,7 @@ class TradingEnv(gym.Env):
         return self._observation(), self._info()
 
     def step(self, action: int):
-        action      = int(action)
+        action        = int(action)
         current_price = self._current_price()
 
         reward       = 0.0
@@ -195,10 +215,10 @@ class TradingEnv(gym.Env):
                     norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
                     offset_pool = sum(
                         p.unrealized_pnl(current_price, self.spec.contract_size)
-                        for p in self._sim.positions
+                        for p in self._sim._positions
                     ) / norm_denom
 
-                    for pos in list(self._sim.positions):
+                    for pos in list(self._sim._positions):
                         result = self._sim.close_position(current_price, pos.direction, pos.lot_size)
                         if result.trade is not None:
                             self._episode_trades.append(result.trade)
@@ -212,16 +232,16 @@ class TradingEnv(gym.Env):
                     if result.trade is not None:
                         closed_trade = result.trade
                         self._episode_trades.append(closed_trade)
-                else: # OPEN
+                else:  # OPEN
                     result = self._sim.open_position(current_price, direction, lot_size, self._step)
                     reward = self._order_reward(result, is_close_all=False)
-        
+
         self._balance = self.initial_balance + self._sim.cumulative_pnl
         unrealized    = self._sim.total_unrealized_pnl(current_price)
         equity        = self._balance + unrealized
 
         # Cost application based on reward mode
-        total_lots = sum(p.lot_size for p in self._sim.positions)
+        total_lots = sum(p.lot_size for p in self._sim._positions)
         if self.reward_mode == "step":
             if total_lots > 0:
                 reward -= self.holding_cost_per_lot * total_lots
@@ -229,32 +249,27 @@ class TradingEnv(gym.Env):
                 reward -= self.flat_penalty_per_step
 
             # Step-mode: add per-bar equity delta on top of any open/close reward
-            norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
+            norm_denom  = self._prev_equity if self._prev_equity > 0 else self.initial_balance
             step_return = (equity - self._prev_equity) / norm_denom
-            reward += step_return
-            
+            reward     += step_return
+
             # Differential Sharpe Ratio / Variance Penalty
             if self.volatility_penalty_multiplier > 0:
                 self._returns_buffer.append(step_return)
-                if len(self._returns_buffer) > 50:
-                    self._returns_buffer.pop(0)
-                if len(self._returns_buffer) >= 2:
-                    volatility = float(np.std(self._returns_buffer))
-                    reward -= (volatility * self.volatility_penalty_multiplier)
+                volatility = float(np.std(self._returns_buffer))
+                reward    -= volatility * self.volatility_penalty_multiplier
         else:
-            # Sparse mode: holding cost is delayed until close, but flat penalty applies if 0 positions
+            # Sparse mode: holding cost is delayed until close, flat penalty if flat
             if total_lots == 0:
                 reward -= self.flat_penalty_per_step
 
         # Apply Terminal Bankrupt Penalty
-        bankrupt = equity < self.initial_balance * (1.0 - self.max_drawdown_pct)
-        if bankrupt:
-            reward -= self.drawdown_penalty  # Massive explicit penalty on margin call
+        if equity < self._drawdown_threshold:
+            reward -= self.drawdown_penalty
 
         self._prev_equity = equity
-
-        self._step += 1
-        terminated  = self._is_terminated(equity)
+        self._step       += 1
+        terminated        = self._is_terminated(equity)
 
         if terminated and self._sim.has_positions:
             close_price = self._current_price()
@@ -290,36 +305,30 @@ class TradingEnv(gym.Env):
 
     def action_masks(self) -> np.ndarray:
         """
-        Masking logic for explicit Open/Close action space.
+        Single-pass masking for the explicit Open/Close action space.
+        Pre-computed index lists (_open_indices, _close_indices) avoid
+        repeatedly scanning the full action map.
         """
-        mask = np.ones(self.n_actions, dtype=bool)
-        
-        # 1. HOLD (0) is always valid
-        
-        # 2. OPEN actions: Masked if max_positions reached
-        if self.max_positions is not None and self.max_positions > 0:
-            if len(self._sim.positions) >= self.max_positions:
-                for idx, (act_type, _, _) in self._action_map.items():
-                    if act_type == "OPEN":
-                        mask[idx] = False
-        
-        # 3. CLOSE actions: Masked if no matching position exists
-        # 4. CLOSE_ALL: Masked if no positions exist
-        has_pos = self._sim.has_positions
-        if not has_pos:
-            mask[self.n_actions - 1] = False # CLOSE_ALL
-            for idx, (act_type, _, _) in self._action_map.items():
-                if act_type == "CLOSE":
-                    mask[idx] = False
+        mask     = np.ones(self.n_actions, dtype=bool)
+        positions = self._sim._positions
+        n_pos     = len(positions)
+
+        # OPEN actions: mask if at position limit
+        if self.max_positions and n_pos >= self.max_positions:
+            for idx in self._open_indices:
+                mask[idx] = False
+
+        # CLOSE / CLOSE_ALL actions
+        if n_pos == 0:
+            mask[self.n_actions - 1] = False  # CLOSE_ALL
+            for idx, _, _ in self._close_indices:
+                mask[idx] = False
         else:
-            # Check individual close actions
-            pos_info = [(p.direction, p.lot_size) for p in self._sim.positions]
-            for idx, (act_type, direction, lot_size) in self._action_map.items():
-                if act_type == "CLOSE":
-                    match = any(d == direction and abs(l - lot_size) < 1e-9 for d, l in pos_info)
-                    if not match:
-                        mask[idx] = False
-                        
+            pos_info = [(p.direction, p.lot_size) for p in positions]
+            for idx, direction, lot_size in self._close_indices:
+                if not any(d == direction and abs(l - lot_size) < 1e-9 for d, l in pos_info):
+                    mask[idx] = False
+
         return mask
 
     # ------------------------------------------------------------------
@@ -367,11 +376,11 @@ class TradingEnv(gym.Env):
             "total_pnl":      vol_stats["total_pnl"],
             "avg_pnl":        vol_stats["avg_pnl"],
             # Forced close summary — informational
-            "forced_trades":      frc_stats["count"],
-            "forced_total_pnl":   frc_stats["total_pnl"],
+            "forced_trades":    frc_stats["count"],
+            "forced_total_pnl": frc_stats["total_pnl"],
             # Financial metrics include everything
-            "max_drawdown":   max_dd,
-            "final_balance":  self._balance,
+            "max_drawdown":  max_dd,
+            "final_balance": self._balance,
         }
 
     # ------------------------------------------------------------------
@@ -403,14 +412,14 @@ class TradingEnv(gym.Env):
         trade_pnl = result.trade.pnl / norm_denom
 
         # Apply holding costs if sparse
-        bars_open = max(0, self._step - result.trade.open_step)
-        holding_cost = (self.holding_cost_per_lot * result.trade.lot_size * bars_open)
-        trade_pnl -= holding_cost
+        bars_open    = max(0, self._step - result.trade.open_step)
+        holding_cost = self.holding_cost_per_lot * result.trade.lot_size * bars_open
+        trade_pnl   -= holding_cost
 
         if is_close_all and self.portfolio_offset_factor > 0 and trade_pnl < 0:
             if offset_pool > 0:
-                trade_pnl += (self.portfolio_offset_factor * offset_pool)
-                trade_pnl = min(0.0, trade_pnl)  # Exploit fix: cap at 0
+                trade_pnl += self.portfolio_offset_factor * offset_pool
+                trade_pnl  = min(0.0, trade_pnl)  # Exploit fix: cap at 0
 
         return trade_pnl
 
@@ -419,57 +428,61 @@ class TradingEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _observation(self) -> np.ndarray:
-        parts = []
-        t     = min(self._step, self.n_samples - 1)  # Clamp to valid index range
-        ind   = self.obs_config.get("indicators", {})
+        # Write directly into a pre-allocated array — avoids list growth + np.array() call
+        obs = np.zeros(self._obs_dim, dtype=np.float32)
+        t   = min(self._step, self.n_samples - 1)
+        i   = 0  # write cursor
 
         # 1. Sparse lagged close log returns
         close_lr = self.obs_arrays["close_log_returns"]
         for lag in self._price_lags:
-            idx = max(0, t - lag)
-            parts.append(float(close_lr[idx]))
+            obs[i] = close_lr[max(0, t - lag)]
+            i += 1
 
-        # 2. Indicators — index current step, fall back to 0 if missing
-        if ind.get("rsi",       {}).get("enabled", True):
-            parts.append(float(self.obs_arrays["rsi"][t]))
-
-        if ind.get("atr",       {}).get("enabled", True):
-            parts.append(float(self.obs_arrays["atr"][t]))
-
-        if ind.get("ema_ratio", {}).get("enabled", True):
-            parts.append(float(self.obs_arrays["ema_ratio"][t]))
-
-        if ind.get("bollinger", {}).get("enabled", True):
-            parts.append(float(self.obs_arrays["bollinger"][t]))
-
-        if ind.get("momentum",  {}).get("enabled", True):
-            mom = self.obs_arrays["momentum"][t]   # shape (n_periods,)
-            parts.extend(mom.tolist())
-
-        if ind.get("session",   {}).get("enabled", True):
-            parts.extend(self.obs_arrays["session"][t].tolist())
+        # 2. Indicators (flags cached at __init__ — no dict lookup per step)
+        if self._use_rsi:
+            obs[i] = self.obs_arrays["rsi"][t];      i += 1
+        if self._use_atr:
+            obs[i] = self.obs_arrays["atr"][t];      i += 1
+        if self._use_ema:
+            obs[i] = self.obs_arrays["ema_ratio"][t]; i += 1
+        if self._use_boll:
+            obs[i] = self.obs_arrays["bollinger"][t]; i += 1
+        if self._use_momentum:
+            mom = self.obs_arrays["momentum"][t]
+            n_mom = len(mom)
+            obs[i:i + n_mom] = mom
+            i += n_mom
+        if self._use_session:
+            sess = self.obs_arrays["session"][t]
+            n_sess = len(sess)
+            obs[i:i + n_sess] = sess
+            i += n_sess
 
         # 3. Position slots: [direction*lot_size, unrealized_pnl_norm, bars_open_norm] × n_slots
         # Sorted by ticket to guarantee stable slot assignment.
-        price = self._current_price()
-        sorted_positions = sorted(self._sim.positions, key=lambda p: p.ticket)
-        for i in range(self.n_slots):
-            if i < len(sorted_positions):
-                pos = sorted_positions[i]
-                bars_open = max(0, self._step - pos.open_step)
-                parts.append((float(pos.direction) * pos.lot_size) * 10.0)
-                parts.append((pos.unrealized_pnl(price, self.spec.contract_size) / self.initial_balance) * 10.0)
-                parts.append(bars_open / self.n_samples)
-            else:
-                parts.extend([0.0, 0.0, 0.0])
+        price    = self._current_price()
+        cs       = self.spec.contract_size
+        ib       = self.initial_balance
+        ns       = self.n_samples
+        step     = self._step
+        sorted_positions = sorted(self._sim._positions, key=lambda p: p.ticket)
+        for k in range(self.n_slots):
+            if k < len(sorted_positions):
+                pos = sorted_positions[k]
+                obs[i]     = (float(pos.direction) * pos.lot_size) * 10.0
+                obs[i + 1] = (pos.unrealized_pnl(price, cs) / ib) * 10.0
+                obs[i + 2] = max(0, step - pos.open_step) / ns
+            # else: stays 0.0 from np.zeros
+            i += 3
 
         # 4. Account state
         unrealized = self._sim.total_unrealized_pnl(price)
         equity     = self._balance + unrealized
-        parts.append((self._balance - self.initial_balance) / self.initial_balance * 10.0)
-        parts.append((equity - self.initial_balance) / self.initial_balance * 10.0)
+        obs[i]     = (self._balance - ib) / ib * 10.0
+        obs[i + 1] = (equity       - ib) / ib * 10.0
 
-        return np.array(parts, dtype=np.float32)
+        return obs
 
     # ------------------------------------------------------------------
     # Helpers
@@ -481,7 +494,7 @@ class TradingEnv(gym.Env):
     def _is_terminated(self, equity: float) -> bool:
         if self._step >= self._end_step:
             return True
-        if equity < self.initial_balance * (1.0 - self.max_drawdown_pct):
+        if equity < self._drawdown_threshold:
             logger.debug("Margin call at step %d.", self._step)
             return True
         return False

@@ -184,7 +184,7 @@ def obs_dim_from_config(obs_cfg: dict, n_slots: int) -> int:
     if ind.get("ema_ratio",{}).get("enabled", True):  dim += 1
     if ind.get("bollinger",{}).get("enabled", True):  dim += 1
     if ind.get("momentum", {}).get("enabled", True):
-        dim += len(ind["momentum"].get("periods", [5, 20, 50]))
+        dim += len(ind.get("momentum", {}).get("periods", [5, 20, 50]))
     if ind.get("session",  {}).get("enabled", True):  dim += 4
     dim += n_slots * 3   # [direction*lot_size, upnl_norm, bars_open_norm] per slot
     dim += 2             # balance_norm, equity_norm
@@ -229,10 +229,10 @@ def build_obs_arrays(
     arrays["close_log_returns"] = log_returns(close)
 
     if ind.get("rsi", {}).get("enabled", True):
-        arrays["rsi"] = compute_rsi(close, ind["rsi"].get("period", 14))
+        arrays["rsi"] = compute_rsi(close, ind.get("rsi", {}).get("period", 14))
 
     if ind.get("atr", {}).get("enabled", True):
-        arrays["atr"] = compute_atr(high, low, close, ind["atr"].get("period", 14))
+        arrays["atr"] = compute_atr(high, low, close, ind.get("atr", {}).get("period", 14))
 
     if ind.get("ema_ratio", {}).get("enabled", True):
         cfg = ind.get("ema_ratio", {})
@@ -247,7 +247,7 @@ def build_obs_arrays(
                                                     cfg.get("std_dev", 2.0))
 
     if ind.get("momentum", {}).get("enabled", True):
-        periods = ind["momentum"].get("periods", [5, 20, 50])
+        periods = ind.get("momentum", {}).get("periods", [5, 20, 50])
         arrays["momentum"] = compute_momentum(close, periods)
 
     if ind.get("session", {}).get("enabled", True):

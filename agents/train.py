@@ -21,7 +21,12 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
 )
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecNormalize,
+    sync_envs_normalization,
+)
 
 from core.config import load_config, load_symbol_spec
 from env.preprocessor import load_symbol_files
@@ -49,6 +54,13 @@ def _make_env_fn(
     seed:        int,
 ):
     def _init():
+        # Configure logging in worker subprocesses — SubprocVecEnv spawns fresh
+        # processes that default to WARNING, silently dropping INFO/DEBUG logs.
+        logging.basicConfig(
+            level  = logging.INFO,
+            format = "%(asctime)s  %(levelname)-8s  [worker] %(name)s  %(message)s",
+            datefmt= "%Y-%m-%d %H:%M:%S",
+        )
         env = TradingEnv(
             obs_arrays             = obs_arrays,
             raw_close              = raw_close,
@@ -115,6 +127,56 @@ class TradingMetricsCallback(BaseCallback):
         self.logger.record("trading/mean_max_drawdown",       float(np.mean(dds)))
         self.logger.record("trading/mean_forced_closes",      float(np.mean(forced)))
         self._episode_stats.clear()
+
+
+class SaveVecNormalizeCallback(BaseCallback):
+    """
+    Saves the VecNormalize statistics whenever a model checkpoint is saved,
+    ensuring normalization remains consistent if training is resumed.
+    """
+
+    def __init__(self, save_path: str, filename: str = "vec_normalize.pkl", verbose: int = 0):
+        super().__init__(verbose)
+        self.save_path = Path(save_path)
+        self.filename = filename
+
+    def _on_step(self) -> bool:
+        # We tie saving to the existence of a new model file if we wanted,
+        # but here we'll just save it every rollout or rely on CheckpointCallback
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if isinstance(self.training_env, VecNormalize):
+            path = self.save_path / self.filename
+            self.training_env.save(str(path))
+            if self.verbose > 0:
+                log.info("Saved VecNormalize stats to %s", path)
+            
+            # If a best_model.zip exists and is new, we might want to save best stats.
+            # However, since EvalCallback runs during rollout, we'll just periodically 
+            # save a 'best' candidate if the reward is high, OR simply rely on the fact 
+            # that checkpointing happens at the same time.
+            # Cleaner: save to vec_normalize_best.pkl if this is specifically the best model.
+            # But EvalCallback doesn't tell us. For now, just save latest.
+
+
+class SyncVecNormalizeCallback(BaseCallback):
+    """
+    Synchronizes the VecNormalize statistics from the training environment
+    to the evaluation environment before each evaluation rollout.
+    """
+
+    def __init__(self, eval_env: VecNormalize, verbose: int = 0):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        sync_envs_normalization(self.training_env, self.eval_env)
+        if self.verbose > 0:
+            log.info("Synchronized VecNormalize stats to eval_env")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +289,13 @@ def train(
     vec_env   = VecEnvCls(env_fns)
     eval_env  = VecEnvCls(eval_env_fns)
 
+    # Wrap with VecNormalize
+    log.info("Wrapping environments with VecNormalize (norm_obs=True, norm_reward=True)")
+    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    # Eval env: we normalize observations using training stats, but don't normalize rewards
+    # so that the eval callback sees real price/reward values.
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir   = Path(train_cfg["log_dir"]) / f"ppo_{timestamp}"
     model_dir = Path(output_dir)
@@ -240,6 +309,12 @@ def train(
     if model_path is not None:
         log.info("Continuing training from %s", model_path)
         model = MaskablePPO.load(model_path, env=vec_env)
+        # Load existing normalization stats if they exist
+        norm_path = Path(model_path).parent / "vec_normalize.pkl"
+        if norm_path.exists():
+            log.info("Loading VecNormalize stats from %s", norm_path)
+            vec_env = VecNormalize.load(str(norm_path), vec_env)
+            model.set_env(vec_env)
     else:
         log.info("Building new MaskablePPO model.")
         model = MaskablePPO(
@@ -273,6 +348,8 @@ def train(
             verbose     = 1,
         ),
         TradingMetricsCallback(verbose=1),
+        SaveVecNormalizeCallback(save_path=str(model_dir), verbose=1),
+        SyncVecNormalizeCallback(eval_env=eval_env, verbose=1),
     ]
 
     if train_cfg.get("eval_freq", 0) > 0:
@@ -296,7 +373,8 @@ def train(
 
     final_path = model_dir / "ppo_trading_final.zip"
     model.save(str(final_path))
-    log.info("Final model saved → %s", final_path)
+    vec_env.save(str(model_dir / "vec_normalize.pkl"))
+    log.info("Final model and normalization stats saved → %s", model_dir)
 
     vec_env.close()
     eval_env.close()
