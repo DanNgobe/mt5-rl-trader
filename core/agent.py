@@ -9,8 +9,11 @@ Interface contract
 ------------------
     act(env)  — return a scalar int action in [0, env.n_actions-1]:
                    0               = HOLD
-                   1 + tier*2      = BUY  lot_tiers[tier]
-                   2 + tier*2      = SELL lot_tiers[tier]
+                   1 + tier*4      = OPEN_BUY   lot_tiers[tier]
+                   2 + tier*4      = OPEN_SELL  lot_tiers[tier]
+                   3 + tier*4      = CLOSE_BUY  lot_tiers[tier]
+                   4 + tier*4      = CLOSE_SELL lot_tiers[tier]
+                   n_actions - 1   = CLOSE_ALL
 
     reset()   — called at the start of every episode; default is a no-op
     load()    — optional; strategies don't need it

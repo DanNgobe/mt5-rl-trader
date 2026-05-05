@@ -50,6 +50,7 @@ class Position:
     lot_size:    float
     entry_price: float  # actual fill price after spread/slippage
     open_price:  float  # raw market price at open (reference only)
+    tier_index:  int   = -1   # index into the env's lot_pcts tier
     spread_paid: float = 0.0
     slippage:    float = 0.0
     # Maximum favourable / adverse excursion prices (updated each step)
@@ -212,7 +213,7 @@ class TradeSimulator:
         return price_diff * lot_size * self.spec.contract_size
 
     def open_position(self, market_price: float, direction: Direction, lot_size: float,
-                      open_step: int = 0) -> OrderResult:
+                      tier_index: int = -1, open_step: int = 0) -> OrderResult:
         """Open a new position at market price."""
         fill, spread_paid, slippage = self._fill_open(market_price, direction)
         pos = Position(
@@ -221,28 +222,30 @@ class TradeSimulator:
             lot_size    = lot_size,
             entry_price = fill,
             open_price  = market_price,
+            tier_index  = tier_index,
             spread_paid = spread_paid,
             slippage    = slippage,
             open_step   = open_step,
         )
         self._positions.append(pos)
         self._next_ticket += 1
-        logger.debug("Opened %s ticket=%d lot=%.2f entry=%.5f", direction.name, pos.ticket, lot_size, fill)
+        logger.debug("Opened %s ticket=%d lot=%.2f tier=%d entry=%.5f", 
+                     direction.name, pos.ticket, lot_size, tier_index, fill)
         return OrderResult(success=True, position=pos)
 
-    def close_position(self, market_price: float, direction: Direction, lot_size: float) -> OrderResult:
+    def close_position(self, market_price: float, direction: Direction, tier_index: int) -> OrderResult:
         """
-        Close the oldest open position matching direction and lot_size.
+        Close the oldest open position matching direction and tier_index.
 
         Returns OrderResult(invalid=True) if no matching position exists.
         """
         target = next(
             (p for p in self._positions
-             if p.direction == direction and abs(p.lot_size - lot_size) < 1e-9),
+             if p.direction == direction and p.tier_index == tier_index),
             None,
         )
         if target is None:
-            logger.debug("CLOSE_%s %.2f lots: no matching position.", direction.name, lot_size)
+            logger.debug("CLOSE_%s tier %d: no matching position.", direction.name, tier_index)
             return OrderResult(success=False, invalid=True, reason="no_matching_position")
 
         fill, spread_paid, slippage = self._fill_close(market_price, target.direction)
@@ -276,7 +279,7 @@ class TradeSimulator:
         """Close every open position at episode end. All resulting trades are marked forced=True."""
         trades = []
         for pos in list(self._positions):
-            result = self.close_position(market_price, pos.direction, pos.lot_size)
+            result = self.close_position(market_price, pos.direction, pos.tier_index)
             if result.trade is not None:
                 result.trade.forced = True
                 trades.append(result.trade)

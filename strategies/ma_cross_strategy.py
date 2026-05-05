@@ -58,9 +58,8 @@ class MACrossStrategy(BaseStrategy):
         # 1. Close any positions in the wrong direction
         wrong_pos = next((p for p in positions if p.direction != target_dir), None)
         if wrong_pos is not None:
-            # Toggle-close the wrong position
-            tier = min(range(len(env.lot_tiers)),
-                       key=lambda i: abs(env.lot_tiers[i] - wrong_pos.lot_size))
+            # Use the stored tier_index to close the position
+            tier = wrong_pos.tier_index
             if wrong_pos.direction == Direction.LONG:
                 return self._close_buy(tier)   # CLOSE the long
             else:

@@ -49,24 +49,26 @@ def _make_env(prices: np.ndarray, positions: List[Position]) -> SimpleNamespace:
     return env
 
 
-def _long_pos(lot_size: float = 0.1) -> Position:
+def _long_pos(lot_size: float = 0.1, tier_index: int = 0) -> Position:
     return Position(
         ticket      = 1,
         direction   = Direction.LONG,
         lot_size    = lot_size,
         entry_price = 1.1001,
         open_price  = 1.1000,
+        tier_index  = tier_index,
         open_step   = 0,
     )
 
 
-def _short_pos(lot_size: float = 0.1) -> Position:
+def _short_pos(lot_size: float = 0.1, tier_index: int = 0) -> Position:
     return Position(
         ticket      = 2,
         direction   = Direction.SHORT,
         lot_size    = lot_size,
         entry_price = 1.0999,
         open_price  = 1.1000,
+        tier_index  = tier_index,
         open_step   = 0,
     )
 
@@ -93,8 +95,12 @@ def _ramp_down(n: int = 200) -> np.ndarray:
 HOLD      = 0
 BUY_01    = 1
 SELL_01   = 2
-BUY_02    = 3
-SELL_02   = 4
+CBUY_01   = 3
+CSELL_01  = 4
+BUY_02    = 5
+SELL_02   = 6
+CBUY_02   = 7
+CSELL_02  = 8
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +212,9 @@ class TestCloseWrongDirection:
         env    = _make_env(prices, positions=[_long_pos(0.1)])
 
         action = strat.act(env)
-        # The LONG lot_size=0.1 maps to tier 0 → close action = BUY_01
-        assert action == BUY_01, (
-            f"Expected BUY_01={BUY_01} to toggle-close the LONG, got {action}"
+        # To close the LONG 0.1 (tier 0) -> CLOSE_BUY at tier 0
+        assert action == CBUY_01, (
+            f"Expected CBUY_01={CBUY_01} to close the LONG, got {action}"
         )
 
     def test_closes_short_when_bullish(self):
@@ -221,9 +227,9 @@ class TestCloseWrongDirection:
         env    = _make_env(prices, positions=[_short_pos(0.1)])
 
         action = strat.act(env)
-        # The SHORT lot_size=0.1 maps to tier 0 → close action = SELL_01
-        assert action == SELL_01, (
-            f"Expected SELL_01={SELL_01} to toggle-close the SHORT, got {action}"
+        # To close the SHORT 0.1 (tier 0) -> CLOSE_SELL at tier 0
+        assert action == CSELL_01, (
+            f"Expected CSELL_01={CSELL_01} to close the SHORT, got {action}"
         )
 
     def test_tier_matched_to_wrong_position_lot(self):
@@ -233,12 +239,12 @@ class TestCloseWrongDirection:
         """
         strat  = MACrossStrategy(fast=10, slow=50, lot_tier=0)
         prices = _ramp_down(200)
-        env    = _make_env(prices, positions=[_long_pos(0.2)])  # tier 1
+        env    = _make_env(prices, positions=[_long_pos(0.2, tier_index=1)])  # tier 1
 
         action = strat.act(env)
-        # To close the LONG 0.2 → BUY at tier 1
-        assert action == BUY_02, (
-            f"Expected BUY_02={BUY_02} to toggle-close the 0.2-lot LONG, got {action}"
+        # To close the LONG 0.2 (tier 1) -> CLOSE_BUY at tier 1
+        assert action == CBUY_02, (
+            f"Expected CBUY_02={CBUY_02} to close the 0.2-lot LONG, got {action}"
         )
 
 

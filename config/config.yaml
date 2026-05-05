@@ -9,13 +9,9 @@ environment:
   slippage_prob: 0.3                 # range: [0.1, 0.5] — higher = more realistic, harder to train
   slippage_range: [0.00001, 0.0005]  # range: [0.00001, 0.001] — upper bound is ~10 pips
 
-  # Lot size tiers for the possible OPEN/CLOSE actions: [small, medium, large]
-  # Action Space:
-  #   0: HOLD
-  #   1 + tier*4: OPEN_BUY   2 + tier*4: OPEN_SELL
-  #   3 + tier*4: CLOSE_BUY  4 + tier*4: CLOSE_SELL
-  #   n_actions-1: CLOSE_ALL
-  lot_tiers: [0.1, 0.2, 0.5]
+  # Lot size percentages of current equity/margin for the possible OPEN/CLOSE actions.
+  # e.g., 0.01 = 1% of equity used as margin.
+  lot_tiers: [0.01, 0.02, 0.05]
 
   # Maximum simultaneous positions allowed. 
   # Set to 0 or null to disable (unlimited).
@@ -59,8 +55,8 @@ reward:
   reward_mode: step
 
   # Per-step cost per lot held. Discourages holding losers and overtrading.
-  # range: [0.000005, 0.00005] — scale up if agent holds too long, down if it exits too early
-  holding_cost_per_lot: 0.00001
+  # range: [0.0001, 0.001] — scale up if agent holds too long, down if it exits too early
+  holding_cost_per_lot: 0.0002
 
   # Per-step penalty when flat (no open positions). Nudges agent to engage.
   # Keep at 0.0 initially — only enable if agent learns to sit flat all episode.
@@ -92,7 +88,7 @@ reward:
   # Scales a penalty applied based on the standard deviation of the last 50 equity step returns.
   # Encourages slow, stable growth over highly chaotic/volatile equity curves.
   # range: [0.1, 2.0] — disabled for now to allow basic convergence.
-  volatility_penalty_multiplier: 0
+  volatility_penalty_multiplier: 0.5
 
 
 # Observation Configuration

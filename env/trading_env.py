@@ -90,7 +90,7 @@ class TradingEnv(gym.Env):
         self.spec            = symbol_spec
         self.obs_config      = obs_config
         self.initial_balance = initial_balance
-        self.lot_tiers       = list(lot_tiers) if lot_tiers is not None else list(LOT_TIERS)
+        self.lot_pcts        = list(lot_tiers) if lot_tiers is not None else [0.01, 0.02, 0.05]
         self.render_mode     = render_mode
         self.n_samples       = n
 
@@ -109,27 +109,27 @@ class TradingEnv(gym.Env):
         # Pre-compute drawdown threshold — avoids a multiply every step
         self._drawdown_threshold = initial_balance * (1.0 - max_drawdown_pct)
 
-        # Action map: action_idx → (type, Direction, lot_size)
+        # Action map: action_idx → (type, Direction, tier_index)
         # 0 = HOLD
         # 1 + i*4 = OPEN_BUY
         # 2 + i*4 = OPEN_SELL
         # 3 + i*4 = CLOSE_BUY
         # 4 + i*4 = CLOSE_SELL
         # n_actions - 1 = CLOSE_ALL
-        self._action_map: dict[int, tuple[str, Direction, float]] = {}
-        for i, lot in enumerate(self.lot_tiers):
-            self._action_map[1 + i * 4] = ("OPEN",  Direction.LONG,  lot)
-            self._action_map[2 + i * 4] = ("OPEN",  Direction.SHORT, lot)
-            self._action_map[3 + i * 4] = ("CLOSE", Direction.LONG,  lot)
-            self._action_map[4 + i * 4] = ("CLOSE", Direction.SHORT, lot)
+        self._action_map: dict[int, tuple[str, Direction, int]] = {}
+        for i in range(len(self.lot_pcts)):
+            self._action_map[1 + i * 4] = ("OPEN",  Direction.LONG,  i)
+            self._action_map[2 + i * 4] = ("OPEN",  Direction.SHORT, i)
+            self._action_map[3 + i * 4] = ("CLOSE", Direction.LONG,  i)
+            self._action_map[4 + i * 4] = ("CLOSE", Direction.SHORT, i)
 
         # Pre-split action indices by type for O(1) single-pass masking
         self._open_indices:  list[int] = [idx for idx, (t, _, _) in self._action_map.items() if t == "OPEN"]
-        self._close_indices: list[tuple[int, Direction, float]] = [
-            (idx, d, l) for idx, (t, d, l) in self._action_map.items() if t == "CLOSE"
+        self._close_indices: list[tuple[int, Direction, int]] = [
+            (idx, d, t_idx) for idx, (t, d, t_idx) in self._action_map.items() if t == "CLOSE"
         ]
 
-        self.n_actions = 2 + 4 * len(self.lot_tiers)
+        self.n_actions = 2 + 4 * len(self.lot_pcts)
         # n_slots is the number of position slots in the observation vector.
         # If max_positions is unlimited (None or 0), default to 10 slots.
         self.n_slots   = max_positions if (max_positions is not None and max_positions > 0) else 10
@@ -154,7 +154,7 @@ class TradingEnv(gym.Env):
 
         self._sim = TradeSimulator(
             symbol_spec    = symbol_spec,
-            lot_tiers      = self.lot_tiers,
+            lot_tiers      = self.lot_pcts,
             slippage_prob  = slippage_prob,
             slippage_range = slippage_range,
         )
@@ -171,6 +171,15 @@ class TradingEnv(gym.Env):
     # ------------------------------------------------------------------
     # Gym interface
     # ------------------------------------------------------------------
+
+    @property
+    def lot_tiers(self) -> list[float]:
+        """Backward compatibility for components expecting lot_tiers."""
+        return self.lot_pcts
+
+    @lot_tiers.setter
+    def lot_tiers(self, value: list[float]):
+        self.lot_pcts = value
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -208,32 +217,38 @@ class TradingEnv(gym.Env):
         closed_trade = None
 
         self._sim.update_excursions(current_price)
+        unrealized = self._sim.total_unrealized_pnl(current_price)
+        equity     = self._balance + unrealized
 
         if action != 0:  # 0 = HOLD
             if action == self.n_actions - 1:  # CLOSE_ALL
                 if self._sim.has_positions:
                     norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
-                    offset_pool = sum(
-                        p.unrealized_pnl(current_price, self.spec.contract_size)
-                        for p in self._sim._positions
-                    ) / norm_denom
+                    offset_pool = unrealized / norm_denom
 
                     for pos in list(self._sim._positions):
-                        result = self._sim.close_position(current_price, pos.direction, pos.lot_size)
+                        result = self._sim.close_position(current_price, pos.direction, pos.tier_index)
                         if result.trade is not None:
                             self._episode_trades.append(result.trade)
                             closed_trade = result.trade
                         reward += self._order_reward(result, is_close_all=True, offset_pool=offset_pool)
             else:
-                act_type, direction, lot_size = self._action_map[action]
+                act_type, direction, tier_idx = self._action_map[action]
                 if act_type == "CLOSE":
-                    result = self._sim.close_position(current_price, direction, lot_size)
+                    result = self._sim.close_position(current_price, direction, tier_idx)
                     reward = self._order_reward(result, is_close_all=False)
                     if result.trade is not None:
                         closed_trade = result.trade
                         self._episode_trades.append(closed_trade)
                 else:  # OPEN
-                    result = self._sim.open_position(current_price, direction, lot_size, self._step)
+                    # Calculate dynamic lot size: (equity * pct) / (contract_size * margin_rate)
+                    pct = self.lot_pcts[tier_idx]
+                    lot_size = (equity * pct) / (self.spec.contract_size * self.spec.margin_rate)
+                    lot_size = np.clip(lot_size, self.spec.min_lot, self.spec.max_lot)
+                    # Round to 2 decimal places for realism (MT5 standard)
+                    lot_size = float(round(lot_size, 2))
+
+                    result = self._sim.open_position(current_price, direction, lot_size, tier_idx, self._step)
                     reward = self._order_reward(result, is_close_all=False)
 
         self._balance = self.initial_balance + self._sim.cumulative_pnl
@@ -324,9 +339,10 @@ class TradingEnv(gym.Env):
             for idx, _, _ in self._close_indices:
                 mask[idx] = False
         else:
-            pos_info = [(p.direction, p.lot_size) for p in positions]
-            for idx, direction, lot_size in self._close_indices:
-                if not any(d == direction and abs(l - lot_size) < 1e-9 for d, l in pos_info):
+            open_tiers = [p.tier_index for p in positions]
+            for idx, direction, tier_idx in self._close_indices:
+                # Check if there is an open position in this direction with this tier_index
+                if not any(p.direction == direction and p.tier_index == tier_idx for p in positions):
                     mask[idx] = False
 
         return mask
@@ -395,6 +411,10 @@ class TradingEnv(gym.Env):
         norm_denom = self._prev_equity if self._prev_equity > 0 else self.initial_balance
 
         if result.trade is None:
+            if result.position is None:
+                # Order failed or was invalid (e.g. closing non-existent position)
+                return 0.0
+            
             # Open: charge spread cost
             actual_spread_norm = result.position.spread_paid / norm_denom
             if self.reward_mode == "step":
